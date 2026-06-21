@@ -145,3 +145,5 @@ docs-out/
 
 .DS_Store
 
+# Internal infra pointers — never commit to public GitHub
+INTERNAL.md
