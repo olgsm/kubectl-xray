@@ -19,7 +19,7 @@ var envDumpCommand = []string{"sh", "-c", "tr '\\0' '\\n' < /proc/1/environ"}
 
 // resolvePod accepts either a pod name or a deployment name, returning a
 // concrete pod to target (a Running one when resolving via deployment).
-func (o *XRayOptions) resolvePod(ctx context.Context) (*corev1.Pod, error) {
+func (o *Options) resolvePod(ctx context.Context) (*corev1.Pod, error) {
 	pods := o.clientset.CoreV1().Pods(o.namespace)
 
 	pod, err := pods.Get(ctx, o.target, metav1.GetOptions{})
@@ -61,7 +61,7 @@ func pickPod(pods []corev1.Pod, deployment string) (*corev1.Pod, error) {
 
 // resolveContainer applies the -c flag, the default-container annotation, then
 // falls back to the first container.
-func (o *XRayOptions) resolveContainer(pod *corev1.Pod) string {
+func (o *Options) resolveContainer(pod *corev1.Pod) string {
 	if o.container != "" {
 		return o.container
 	}
@@ -73,7 +73,7 @@ func (o *XRayOptions) resolveContainer(pod *corev1.Pod) string {
 
 // capture runs command in an ephemeral toolbox container alongside the target
 // and streams its output to o.Out. Shared by env/dump/etc.
-func (o *XRayOptions) capture(ctx context.Context, command []string) error {
+func (o *Options) capture(ctx context.Context, command []string) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err

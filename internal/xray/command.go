@@ -8,14 +8,14 @@ import (
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 )
 
-func (o *XRayOptions) addCaptureFlags(cmd *cobra.Command) {
+func (o *Options) addCaptureFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&o.container, "container", "c", "", "Name of the container")
 	cmd.Flags().StringVar(&o.image, "image", "busybox:1.36", "Toolbox image for the debug container")
 	cmd.Flags().Int64Var(&o.asUser, "run-as-user", 0, "Run the debug container as this UID (overrides the UID derived from the target)")
 }
 
 // newCaptureCmd wires the shared Complete/Validate/capture lifecycle for a mode.
-func newCaptureCmd(o *XRayOptions, use, short string, command []string) *cobra.Command {
+func newCaptureCmd(o *Options, use, short string, command []string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   use,
 		Short: short,
@@ -47,7 +47,7 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 	configFlags.AddFlags(root.PersistentFlags())
 
 	// Each subcommand gets its own options sharing the persistent configFlags.
-	envOpts := &XRayOptions{configFlags: configFlags, IOStreams: streams}
+	envOpts := &Options{configFlags: configFlags, IOStreams: streams}
 	root.AddCommand(newCaptureCmd(envOpts,
 		"env <pod|deployment>",
 		"Capture the runtime environment of a pod's container",

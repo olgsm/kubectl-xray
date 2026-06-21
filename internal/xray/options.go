@@ -9,7 +9,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-type XRayOptions struct {
+type Options struct {
 	configFlags *genericclioptions.ConfigFlags
 	genericiooptions.IOStreams
 
@@ -24,7 +24,7 @@ type XRayOptions struct {
 	userOverride *int64 // set from --run-as-user when explicitly provided
 }
 
-func (o *XRayOptions) Complete(c *cobra.Command, args []string) error {
+func (o *Options) Complete(c *cobra.Command, args []string) error {
 	ns, _, err := o.configFlags.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
@@ -44,7 +44,7 @@ func (o *XRayOptions) Complete(c *cobra.Command, args []string) error {
 	return err
 }
 
-func (o *XRayOptions) Validate() error {
+func (o *Options) Validate() error {
 	if o.target == "" {
 		return fmt.Errorf("pod or deployment name is required")
 	}
@@ -56,6 +56,6 @@ func (o *XRayOptions) Validate() error {
 
 // logf writes a progress line to stderr (ErrOut), keeping stdout clean for the
 // captured payload so it stays pipeable.
-func (o *XRayOptions) logf(format string, args ...any) {
-	fmt.Fprintf(o.ErrOut, "xray: "+format+"\n", args...)
+func (o *Options) logf(format string, args ...any) {
+	_, _ = fmt.Fprintf(o.ErrOut, "xray: "+format+"\n", args...)
 }

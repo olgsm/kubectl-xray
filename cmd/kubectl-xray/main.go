@@ -16,8 +16,6 @@ func main() {
 	os.Exit(run())
 }
 
-// run holds the body so deferred cleanup (signal stop) runs before the process
-// exits — os.Exit in main would skip it.
 func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
