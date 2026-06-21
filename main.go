@@ -9,26 +9,26 @@ import (
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
 )
 
 type XRayOptions struct {
 	configFlags *genericclioptions.ConfigFlags
 	genericiooptions.IOStreams
 
-	restConfig *rest.Config
-	clientset  kubernetes.Interface
+	clientset kubernetes.Interface
 
 	namespace string
-	pod       string
+	target    string // pod or workload (deployment) name from args
 	container string
+	image     string
+
+	asUser       int64
+	userOverride *int64 // set from --run-as-user when explicitly provided
 }
 
 func (o *XRayOptions) Complete(c *cobra.Command, args []string) error {
@@ -37,93 +37,158 @@ func (o *XRayOptions) Complete(c *cobra.Command, args []string) error {
 		return err
 	}
 	o.namespace = ns
-	o.pod = args[0]
+	o.target = args[0]
 
-	o.restConfig, err = o.configFlags.ToRESTConfig()
+	if c.Flags().Changed("run-as-user") {
+		o.userOverride = &o.asUser
+	}
+
+	restConfig, err := o.configFlags.ToRESTConfig()
 	if err != nil {
 		return err
 	}
-	o.clientset, err = kubernetes.NewForConfig(o.restConfig)
-	if err != nil {
-		return err
-	}
-	return nil
+	o.clientset, err = kubernetes.NewForConfig(restConfig)
+	return err
 }
 
 func (o *XRayOptions) Validate() error {
-	if o.pod == "" {
-		return fmt.Errorf("pod name is required")
+	if o.target == "" {
+		return fmt.Errorf("pod or deployment name is required")
+	}
+	if o.image == "" {
+		return fmt.Errorf("toolbox image is required (--image)")
 	}
 	return nil
 }
 
-// defaultContainerAnnotation lets a pod nominate its primary container,
-// matching kubectl's container-selection behavior.
+// logf writes a progress line to stderr (ErrOut), keeping stdout clean for the
+// captured payload so it stays pipeable.
+func (o *XRayOptions) logf(format string, args ...any) {
+	fmt.Fprintf(o.ErrOut, "xray: "+format+"\n", args...)
+}
+
 const defaultContainerAnnotation = "kubectl.kubernetes.io/default-container"
 
-func (o *XRayOptions) Run(ctx context.Context) error {
-	pod, err := o.clientset.CoreV1().Pods(o.namespace).Get(ctx, o.pod, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("getting pod %s/%s: %w", o.namespace, o.pod, err)
+// envDumpCommand reads the target's runtime environment from /proc without
+// relying on any binary in the target image — only the toolbox needs sh/tr.
+// Redirection (not cat|tr) so a permission failure yields a non-zero exit
+// instead of being masked by tr's success at the end of a pipe.
+var envDumpCommand = []string{"sh", "-c", "tr '\\0' '\\n' < /proc/1/environ"}
+
+// resolvePod accepts either a pod name or a deployment name, returning a
+// concrete pod to target (a Running one when resolving via deployment).
+func (o *XRayOptions) resolvePod(ctx context.Context) (*corev1.Pod, error) {
+	pods := o.clientset.CoreV1().Pods(o.namespace)
+
+	pod, err := pods.Get(ctx, o.target, metav1.GetOptions{})
+	if err == nil {
+		return pod, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("getting pod %s/%s: %w", o.namespace, o.target, err)
 	}
 
-	container := o.container
-	if container == "" {
-		if name := pod.Annotations[defaultContainerAnnotation]; name != "" {
-			container = name
-		} else {
-			container = pod.Spec.Containers[0].Name
+	// Not a pod — try a deployment of that name.
+	dep, derr := o.clientset.AppsV1().Deployments(o.namespace).Get(ctx, o.target, metav1.GetOptions{})
+	if derr != nil {
+		return nil, fmt.Errorf("no pod or deployment named %q in namespace %s", o.target, o.namespace)
+	}
+	sel, serr := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if serr != nil {
+		return nil, fmt.Errorf("building selector for deployment %s: %w", o.target, serr)
+	}
+	list, lerr := pods.List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+	if lerr != nil {
+		return nil, fmt.Errorf("listing pods for deployment %s: %w", o.target, lerr)
+	}
+	return pickPod(list.Items, o.target)
+}
+
+// pickPod prefers a Running pod, falling back to the first one.
+func pickPod(pods []corev1.Pod, deployment string) (*corev1.Pod, error) {
+	if len(pods) == 0 {
+		return nil, fmt.Errorf("deployment %q has no pods", deployment)
+	}
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning {
+			return &pods[i], nil
 		}
 	}
-
-	req := o.clientset.CoreV1().RESTClient().
-		Post().
-		Resource("pods").
-		Namespace(o.namespace).
-		Name(o.pod).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   []string{"env"},
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	// WebSocket (GET) with SPDY (POST) fallback for older clusters.
-	wsExec, err := remotecommand.NewWebSocketExecutor(o.restConfig, "GET", req.URL().String())
-	if err != nil {
-		return fmt.Errorf("creating websocket executor: %w", err)
-	}
-	spdyExec, err := remotecommand.NewSPDYExecutor(o.restConfig, "POST", req.URL())
-	if err != nil {
-		return fmt.Errorf("creating spdy executor: %w", err)
-	}
-	exec, err := remotecommand.NewFallbackExecutor(wsExec, spdyExec, func(err error) bool {
-		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
-	})
-	if err != nil {
-		return fmt.Errorf("creating fallback executor: %w", err)
-	}
-
-	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: o.Out,
-		Stderr: o.ErrOut,
-	})
+	return &pods[0], nil
 }
 
-func NewXRayOptions(streams genericiooptions.IOStreams) *XRayOptions {
-	return &XRayOptions{
-		configFlags: genericclioptions.NewConfigFlags(true),
-		IOStreams:   streams,
+// resolveContainer applies the -c flag, the default-container annotation, then
+// falls back to the first container.
+func (o *XRayOptions) resolveContainer(pod *corev1.Pod) string {
+	if o.container != "" {
+		return o.container
 	}
+	if name := pod.Annotations[defaultContainerAnnotation]; name != "" {
+		return name
+	}
+	return pod.Spec.Containers[0].Name
 }
 
-func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
-	o := NewXRayOptions(streams)
+// capture runs command in an ephemeral toolbox container alongside the target
+// and streams its output to o.Out. Shared by env/dump/etc.
+func (o *XRayOptions) capture(ctx context.Context, command []string) error {
+	pod, err := o.resolvePod(ctx)
+	if err != nil {
+		return err
+	}
+	container := o.resolveContainer(pod)
+	o.logf("targeting %s/%s container %q", o.namespace, pod.Name, container)
 
+	// Match the target's UID: spec -> --run-as-user -> runtime /proc probe.
+	uid, gid := deriveUser(pod, container)
+	if o.userOverride != nil {
+		uid = o.userOverride
+	}
+	if uid == nil {
+		o.logf("no runAsUser in spec; probing PID 1 to discover the UID...")
+		uid, pod, err = discoverTargetUID(ctx, o.clientset, o.namespace, pod, container, o.image)
+		if err != nil {
+			return err
+		}
+		o.logf("discovered UID %d", *uid)
+	}
+
+	ec, err := buildEphemeralContainer(container, o.image, command, false, uid, gid)
+	if err != nil {
+		return err
+	}
+	o.logf("injecting debug container %s (as UID %d)...", ec.Name, *uid)
+	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
+	if err != nil {
+		return err
+	}
+	o.logf("waiting for %s to start...", ec.Name)
+	term, err := waitForEphemeralStart(ctx, o.clientset, o.namespace, pod.Name, ec.Name)
+	if err != nil {
+		return err
+	}
+	// Stream logs whether it's still running or already finished — the output
+	// is the captured evidence, readable in both cases.
+	if err := streamEphemeralLogs(ctx, o.clientset, o.namespace, pod.Name, ec.Name, o.Out); err != nil {
+		return err
+	}
+	if term != nil && term.ExitCode != 0 {
+		return fmt.Errorf("%s exited %d (%s)", ec.Name, term.ExitCode, term.Reason)
+	}
+	return nil
+}
+
+func (o *XRayOptions) addCaptureFlags(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&o.container, "container", "c", "", "Name of the container")
+	cmd.Flags().StringVar(&o.image, "image", "busybox:1.36", "Toolbox image for the debug container")
+	cmd.Flags().Int64Var(&o.asUser, "run-as-user", 0, "Run the debug container as this UID (overrides the UID derived from the target)")
+}
+
+// newCaptureCmd wires the shared Complete/Validate lifecycle for a capture mode.
+func newCaptureCmd(o *XRayOptions, use, short string, command []string) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "kubectl-xray [pod] [flags]",
-		Short: "Inspect pod environments and capture execution dumps",
+		Use:   use,
+		Short: short,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			if err := o.Complete(c, args); err != nil {
@@ -132,14 +197,46 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 			if err := o.Validate(); err != nil {
 				return err
 			}
-			return o.Run(c.Context())
+			return o.capture(c.Context(), command)
 		},
 	}
-
-	o.configFlags.AddFlags(cmd.Flags())
-	cmd.Flags().StringVarP(&o.container, "container", "c", "", "Name of the container")
-
+	o.addCaptureFlags(cmd)
 	return cmd
+}
+
+func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
+	configFlags := genericclioptions.NewConfigFlags(true)
+
+	root := &cobra.Command{
+		Use:           "kubectl-xray",
+		Short:         "Inspect pod environments and capture execution dumps",
+		SilenceUsage:  true, // don't dump usage on a runtime error
+		SilenceErrors: true, // we print the error ourselves in main
+	}
+	root.CompletionOptions.DisableDefaultCmd = true // not useful for a kubectl plugin
+	configFlags.AddFlags(root.PersistentFlags())
+
+	// Each subcommand gets its own options sharing the persistent configFlags.
+	envOpts := &XRayOptions{configFlags: configFlags, IOStreams: streams}
+	root.AddCommand(newCaptureCmd(envOpts,
+		"env <pod|deployment>",
+		"Capture the runtime environment of a pod's container",
+		envDumpCommand,
+	))
+
+	// TODO: dump command (JVM thread/heap, Go goroutine/pprof). Stubbed for now.
+	dumpOpts := &XRayOptions{configFlags: configFlags, IOStreams: streams}
+	dump := newCaptureCmd(dumpOpts,
+		"dump <pod|deployment>",
+		"Capture an execution dump from a pod's container (not yet implemented)",
+		nil,
+	)
+	dump.RunE = func(c *cobra.Command, args []string) error {
+		return fmt.Errorf("dump: not implemented yet")
+	}
+	root.AddCommand(dump)
+
+	return root
 }
 
 func main() {
@@ -154,6 +251,7 @@ func main() {
 	cmd := NewCmdXRay(streams)
 
 	if err := cmd.ExecuteContext(ctx); err != nil {
+		fmt.Fprintln(streams.ErrOut, "Error:", err)
 		os.Exit(1)
 	}
 }
