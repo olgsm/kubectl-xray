@@ -137,7 +137,6 @@ func (o *XRayOptions) capture(ctx context.Context, command []string) error {
 		return err
 	}
 	container := o.resolveContainer(pod)
-	o.logf("targeting %s/%s container %q", o.namespace, pod.Name, container)
 
 	// Match the target's UID: spec -> --run-as-user -> runtime /proc probe.
 	uid, gid := deriveUser(pod, container)
@@ -145,24 +144,22 @@ func (o *XRayOptions) capture(ctx context.Context, command []string) error {
 		uid = o.userOverride
 	}
 	if uid == nil {
-		o.logf("no runAsUser in spec; probing PID 1 to discover the UID...")
+		o.logf("%s/%s container %q has no runAsUser; probing PID 1 to discover it...", o.namespace, pod.Name, container)
 		uid, pod, err = discoverTargetUID(ctx, o.clientset, o.namespace, pod, container, o.image)
 		if err != nil {
 			return err
 		}
-		o.logf("discovered UID %d", *uid)
+		o.logf("discovered UID %d; injecting debug container as that UID...", *uid)
 	}
 
 	ec, err := buildEphemeralContainer(container, o.image, command, false, uid, gid)
 	if err != nil {
 		return err
 	}
-	o.logf("injecting debug container %s (as UID %d)...", ec.Name, *uid)
 	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
 	if err != nil {
 		return err
 	}
-	o.logf("waiting for %s to start...", ec.Name)
 	term, err := waitForEphemeralStart(ctx, o.clientset, o.namespace, pod.Name, ec.Name)
 	if err != nil {
 		return err

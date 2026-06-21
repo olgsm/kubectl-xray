@@ -38,29 +38,20 @@ func deriveUser(pod *corev1.Pod, targetContainer string) (uid, gid *int64) {
 			continue
 		}
 		if sc := c.SecurityContext; sc != nil {
-			uid, gid = copyInt64(sc.RunAsUser), copyInt64(sc.RunAsGroup)
+			uid, gid = sc.RunAsUser, sc.RunAsGroup
 		}
 		break
 	}
 	// Pod-level fills whatever the container left unset.
 	if psc := pod.Spec.SecurityContext; psc != nil {
 		if uid == nil {
-			uid = copyInt64(psc.RunAsUser)
+			uid = psc.RunAsUser
 		}
 		if gid == nil {
-			gid = copyInt64(psc.RunAsGroup)
+			gid = psc.RunAsGroup
 		}
 	}
 	return uid, gid
-}
-
-// copyInt64 dereferences and re-pointers so callers can't mutate the pod's spec.
-func copyInt64(p *int64) *int64 {
-	if p == nil {
-		return nil
-	}
-	v := *p
-	return new(v)
 }
 
 // randSuffix yields a short hex suffix so repeated runs don't collide on name.
