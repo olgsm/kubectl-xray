@@ -1,11 +1,8 @@
-package main
+package xray
 
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -222,33 +219,14 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 	))
 
 	// TODO: dump command (JVM thread/heap, Go goroutine/pprof). Stubbed for now.
-	dumpOpts := &XRayOptions{configFlags: configFlags, IOStreams: streams}
-	dump := newCaptureCmd(dumpOpts,
-		"dump <pod|deployment>",
-		"Capture an execution dump from a pod's container (not yet implemented)",
-		nil,
-	)
-	dump.RunE = func(c *cobra.Command, args []string) error {
-		return fmt.Errorf("dump: not implemented yet")
-	}
-	root.AddCommand(dump)
+	root.AddCommand(&cobra.Command{
+		Use:   "dump <pod|deployment>",
+		Short: "Capture an execution dump from a pod's container (not yet implemented)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return fmt.Errorf("dump: not implemented yet")
+		},
+	})
 
 	return root
-}
-
-func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	streams := genericiooptions.IOStreams{
-		In:     os.Stdin,
-		Out:    os.Stdout,
-		ErrOut: os.Stderr,
-	}
-	cmd := NewCmdXRay(streams)
-
-	if err := cmd.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(streams.ErrOut, "Error:", err)
-		os.Exit(1)
-	}
 }
