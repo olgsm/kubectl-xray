@@ -44,8 +44,3 @@ quick probe when neither is set.
 3. **Preserve + share sessions** _(planned)_ — capture termination context via a
    watch on the `Terminated` transition (before it's overwritten); save output +
    dumps; share a link; attach to an incident.
-
-### TODO
-- Redaction: env/dumps contain secrets; redact before anything leaves the cluster. Make it default-on. Allow to override.
-- Remember used toolbox images, add a handy selector for it.
-- Admission-safe profiles: restricted default + `--custom` overlay. Mimic kubectl debug with a handy default?
