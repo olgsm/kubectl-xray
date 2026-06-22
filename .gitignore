@@ -143,8 +143,6 @@ docs-out/
 .vscode/
 *.swp
 
-.DS_Store
-
 notes/
 
 # Local dump bundles (jvm-dump output)

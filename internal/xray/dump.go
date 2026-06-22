@@ -146,15 +146,15 @@ func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
 	var b strings.Builder
 	b.WriteString(`W="$(mktemp -d)"; `)
 	if thread {
-		fmt.Fprintf(&b, `jstack 1 > "$W/%s.jstack" 2>/dev/null; `, name)
+		b.WriteString(fmt.Sprintf(`jstack 1 > "$W/%s.jstack" 2>/dev/null; `, name))
 	}
 	if histogram {
-		fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt" 2>/dev/null; `, name)
+		b.WriteString(fmt.Sprintf(`jcmd 1 GC.class_histogram > "$W/%s.histogram.txt" 2>/dev/null; `, name))
 	}
 	if heap {
 		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
 		// back via /proc/1/root (same UID), then stage it in the work dir.
-		fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; `, name, name)
+		b.WriteString(fmt.Sprintf(`jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; `, name, name))
 	}
 	b.WriteString(`tar cf - -C "$W" .`)
 	return b.String()
