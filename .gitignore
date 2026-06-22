@@ -142,8 +142,7 @@ docs-out/
 .idea/
 .vscode/
 *.swp
-
-notes/
+CLAUDE.local.md
 
 # Local dump bundles (jvm-dump output)
 /dumps/
