@@ -146,3 +146,6 @@ docs-out/
 .DS_Store
 
 notes/
+
+# Local dump bundles (jvm-dump output)
+/dumps/

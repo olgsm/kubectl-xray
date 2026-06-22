@@ -27,19 +27,25 @@ with RBAC and shareable+expirable links.
 # build & install on PATH
 go build -o kubectl-xray ./cmd/kubectl-xray && mv kubectl-xray /usr/local/bin/
 
-# capture a container's runtime env (works on distroless)
+# capture JVM dumps (thread + GC histogram + heap) into a local bundle
+kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dumps
+
+# env reads the target's /proc/1/environ (works on distroless)
 kubectl xray env <pod|deployment> -n <namespace> [-c <container>]
 ```
 
-The debug container runs as the target's UID so it can read `/proc/1/environ`.
-That UID is taken from the pod spec, or `--run-as-user`, or auto-discovered by a
-quick probe when neither is set.
+Commands run in a **toolbox image** (`--image`) injected alongside the target,
+sharing its PID namespace (reach the target's filesystem via `/proc/<pid>/root/`).
+The debug container runs as the target's UID so it can read `/proc/1/...` and
+attach to the JVM; that UID is derived from the pod spec, or set via `--run-as-user`, or is
+auto-discovered by a quick probe when neither is set. `jvm-dump` writes artifacts
+into `<output>/<pod>-<timestamp>/`; `env` streams to stdout (pipeable).
 
 ## Use cases
 
 1. **Env from a distroless container** ✅ — read `/proc/<pid>/environ` from a
    UID-matched ephemeral toolbox container; no `env`/shell needed in the target.
-2. **Capture dumps** _(planned)_ — JVM (jattach/async-profiler) and Go (dlv/pprof)
+2. **Capture dumps** ✅ — JVM (jattach/async-profiler) and Go (dlv/pprof) _(planned)_
    under an admission-safe profile.
 3. **Preserve + share sessions** _(planned)_ — capture termination context via a
    watch on the `Terminated` transition (before it's overwritten); save output +

@@ -7,16 +7,18 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 type Options struct {
 	configFlags *genericclioptions.ConfigFlags
 	genericiooptions.IOStreams
 
-	clientset kubernetes.Interface
+	clientset  kubernetes.Interface
+	restConfig *rest.Config
 
 	namespace string
-	target    string // pod or workload (deployment) name from args
+	target    string // pod or workload (deployment)
 	container string
 	image     string
 
@@ -36,11 +38,11 @@ func (o *Options) Complete(c *cobra.Command, args []string) error {
 		o.userOverride = &o.asUser
 	}
 
-	restConfig, err := o.configFlags.ToRESTConfig()
+	o.restConfig, err = o.configFlags.ToRESTConfig()
 	if err != nil {
 		return err
 	}
-	o.clientset, err = kubernetes.NewForConfig(restConfig)
+	o.clientset, err = kubernetes.NewForConfig(o.restConfig)
 	return err
 }
 

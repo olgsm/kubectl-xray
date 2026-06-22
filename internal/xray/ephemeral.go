@@ -14,7 +14,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/streaming/pkg/httpstream"
 )
 
 // probeUID runs the discovery container as an arbitrary nonroot user; it only
@@ -69,7 +73,7 @@ func randSuffix() (string, error) {
 // It returns the updated pod (the probe is appended to its ephemeral list).
 func discoverTargetUID(ctx context.Context, client kubernetes.Interface, namespace string, pod *corev1.Pod, targetContainer, image string) (*int64, *corev1.Pod, error) {
 	pu := probeUID
-	ec, err := buildEphemeralContainer(targetContainer, image, []string{"cat", "/proc/1/status"}, false, &pu, nil)
+	ec, err := buildEphemeralContainer(targetContainer, image, []string{"cat", "/proc/1/status"}, false, false, &pu, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -112,7 +116,7 @@ func parseStatusUID(status string) (int64, error) {
 
 // buildEphemeralContainer assembles the debug container spec under the restricted
 // profile, running as the already-resolved uid/gid.
-func buildEphemeralContainer(targetContainer, image string, command []string, tty bool, uid, gid *int64) (corev1.EphemeralContainer, error) {
+func buildEphemeralContainer(targetContainer, image string, command []string, stdin, tty bool, uid, gid *int64) (corev1.EphemeralContainer, error) {
 	suffix, err := randSuffix()
 	if err != nil {
 		return corev1.EphemeralContainer{}, fmt.Errorf("generating container name: %w", err)
@@ -122,7 +126,7 @@ func buildEphemeralContainer(targetContainer, image string, command []string, tt
 		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
 			Name:    "xray-debug-" + suffix,
 			Image:   image,
-			Stdin:   tty,
+			Stdin:   stdin,
 			TTY:     tty,
 			Command: command,
 			SecurityContext: &corev1.SecurityContext{
@@ -166,9 +170,9 @@ func injectEphemeralContainer(ctx context.Context, client kubernetes.Interface, 
 }
 
 // waitForEphemeralStart blocks until the named ephemeral container has started:
-// it returns once the container is Running, or its terminal state if it already
-// finished (a fast one-shot command can exit before we observe Running). The
-// caller streams logs in both cases and inspects the returned exit code.
+// it returns a nil terminal state once the container is Running, or its terminal
+// state if it already finished (a fast one-shot command can exit before we
+// observe Running). Callers decide what to do with an early exit.
 func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string) (*corev1.ContainerStateTerminated, error) {
 	sel := fields.OneTermEqualSelector("metadata.name", podName).String()
 	w, err := client.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{FieldSelector: sel})
@@ -202,6 +206,41 @@ func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, nam
 			}
 		}
 	}
+}
+
+// attachToContainer attaches to a running container's stdio over a binary-safe stream.
+// Feeding stdin lets the container's command block on `read _; ...` until we're connected;
+// a trick is needed to guarantee that we don't miss its stdout (i.e., to avoid the race upon attach).
+func attachToContainer(ctx context.Context, restConfig *rest.Config, client kubernetes.Interface, namespace, podName, containerName string, stdin io.Reader, stdout, stderr io.Writer) error {
+	req := client.CoreV1().RESTClient().
+		Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(podName).
+		SubResource("attach").
+		VersionedParams(&corev1.PodAttachOptions{
+			Container: containerName,
+			Stdin:     stdin != nil,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	ws, err := remotecommand.NewWebSocketExecutor(restConfig, "GET", req.URL().String())
+	if err != nil {
+		return fmt.Errorf("creating websocket executor: %w", err)
+	}
+	spdy, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("creating spdy executor: %w", err)
+	}
+	exec, err := remotecommand.NewFallbackExecutor(ws, spdy, func(err error) bool {
+		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
+	})
+	if err != nil {
+		return fmt.Errorf("creating fallback executor: %w", err)
+	}
+
+	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdin: stdin, Stdout: stdout, Stderr: stderr})
 }
 
 // streamEphemeralLogs follows the container's stdout into out, capturing it

@@ -71,17 +71,10 @@ func (o *Options) resolveContainer(pod *corev1.Pod) string {
 	return pod.Spec.Containers[0].Name
 }
 
-// capture runs command in an ephemeral toolbox container alongside the target
-// and streams its output to o.Out. Shared by env/dump/etc.
-func (o *Options) capture(ctx context.Context, command []string) error {
-	pod, err := o.resolvePod(ctx)
-	if err != nil {
-		return err
-	}
-	container := o.resolveContainer(pod)
-
-	// Match the target's UID: spec -> --run-as-user -> runtime /proc probe.
-	uid, gid := deriveUser(pod, container)
+// resolveUID matches the target's UID (spec -> --run-as-user -> runtime probe).
+// It returns the possibly-updated pod (the probe appends an ephemeral container).
+func (o *Options) resolveUID(ctx context.Context, pod *corev1.Pod, container string) (uid, gid *int64, updated *corev1.Pod, err error) {
+	uid, gid = deriveUser(pod, container)
 	if o.userOverride != nil {
 		uid = o.userOverride
 	}
@@ -89,12 +82,28 @@ func (o *Options) capture(ctx context.Context, command []string) error {
 		o.logf("%s/%s container %q has no runAsUser; probing PID 1 to discover it...", o.namespace, pod.Name, container)
 		uid, pod, err = discoverTargetUID(ctx, o.clientset, o.namespace, pod, container, o.image)
 		if err != nil {
-			return err
+			return nil, nil, nil, err
 		}
-		o.logf("discovered UID %d; injecting debug container as that UID...", *uid)
+		o.logf("discovered UID %d", *uid)
+	}
+	return uid, gid, pod, nil
+}
+
+// capture runs command in an ephemeral toolbox container alongside the target
+// and streams its stdout to o.Out via the container logs. Used by env.
+func (o *Options) capture(ctx context.Context, command []string) error {
+	pod, err := o.resolvePod(ctx)
+	if err != nil {
+		return err
+	}
+	container := o.resolveContainer(pod)
+
+	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
+	if err != nil {
+		return err
 	}
 
-	ec, err := buildEphemeralContainer(container, o.image, command, false, uid, gid)
+	ec, err := buildEphemeralContainer(container, o.image, command, false, false, uid, gid)
 	if err != nil {
 		return err
 	}
@@ -106,6 +115,7 @@ func (o *Options) capture(ctx context.Context, command []string) error {
 	if err != nil {
 		return err
 	}
+
 	// Stream logs whether it's still running or already finished — the output
 	// is the captured evidence, readable in both cases.
 	if err := streamEphemeralLogs(ctx, o.clientset, o.namespace, pod.Name, ec.Name, o.Out); err != nil {
@@ -114,5 +124,6 @@ func (o *Options) capture(ctx context.Context, command []string) error {
 	if term != nil && term.ExitCode != 0 {
 		return fmt.Errorf("%s exited %d (%s)", ec.Name, term.ExitCode, term.Reason)
 	}
+
 	return nil
 }
