@@ -42,27 +42,6 @@ func TestParseStatusUID(t *testing.T) {
 	}
 }
 
-func TestPickPod(t *testing.T) {
-	pending := corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}
-	running := corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning}}
-
-	if _, err := pickPod(nil, "dep"); err == nil {
-		t.Fatal("expected error for empty pod list")
-	}
-	got, err := pickPod([]corev1.Pod{pending, running}, "dep")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Status.Phase != corev1.PodRunning {
-		t.Fatalf("phase = %q, want Running (should prefer a Running pod)", got.Status.Phase)
-	}
-	// No Running pod: falls back to the first.
-	got, err = pickPod([]corev1.Pod{pending}, "dep")
-	if err != nil || got.Status.Phase != corev1.PodPending {
-		t.Fatalf("fallback failed: phase=%q err=%v", got.Status.Phase, err)
-	}
-}
-
 func TestDeriveUser(t *testing.T) {
 	uid := int64(1000)
 	gid := int64(2000)

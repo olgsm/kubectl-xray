@@ -200,6 +200,8 @@ func countTarEntries(r io.Reader) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer func() { _ = gz.Close() }()
+
 	gz.Multistream(false)
 	tr := tar.NewReader(gz)
 	n := 0
@@ -227,6 +229,8 @@ func extractGzTar(r io.Reader, dest string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = gz.Close() }()
+
 	gz.Multistream(false)
 	files, err := extractTar(gz, dest)
 	if err != nil {
