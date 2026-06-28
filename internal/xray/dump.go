@@ -142,18 +142,21 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
 	var b strings.Builder
 	b.WriteString(`W="$(mktemp -d)"; `)
+	// Each tool's stdout goes to a file (or /dev/null); stderr is left on fd 2 so
+	// failures (e.g. a read-only /tmp) reach the client instead of being swallowed.
+	// Only tar writes to stdout.
 	if thread {
-		_, _ = fmt.Fprintf(&b, `jstack 1 > "$W/%s.jstack" 2>/dev/null; `, name)
+		_, _ = fmt.Fprintf(&b, `jstack 1 > "$W/%s.jstack"; `, name)
 	}
 	if histogram {
-		_, _ = fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt" 2>/dev/null; `, name)
+		_, _ = fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt"; `, name)
 	}
 	if heap {
 		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
 		// back via /proc/1/root (same UID), then stage it in the work dir.
 		// rm the heap file from the target afterward so we don't leave secrets
 		// (and a multi-GB file) behind in its /tmp.
-		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; rm -f /proc/1/root/tmp/%s.hprof; `, name, name, name)
+		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null; cp /proc/1/root/tmp/%s.hprof "$W/"; rm -f /proc/1/root/tmp/%s.hprof; `, name, name, name)
 	}
 	b.WriteString(`tar czf - -C "$W" .`)
 	return b.String()
