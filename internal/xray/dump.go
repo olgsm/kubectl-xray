@@ -1,11 +1,8 @@
 package xray
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +13,33 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+
+	"kubectl-xray/internal/archive"
 )
+
+// Store persists a captured dump stream. Named for persistence so a future
+// backend (e.g. an S3 uploader) can satisfy it alongside the local strategies.
+type Store interface {
+	// Put consumes the gzipped-tar stream r and returns the number of artifacts
+	// persisted (0 means the dump produced nothing).
+	Put(r io.Reader) (artifacts int, err error)
+}
+
+// archiveStore writes one portable .tar.gz at path.
+type archiveStore struct{ path string }
+
+func (s archiveStore) Put(r io.Reader) (int, error) { return archive.Write(r, s.path) }
+
+// dirStore unpacks the dump into dest (the --extract strategy).
+type dirStore struct{ dest string }
+
+func (s dirStore) Put(r io.Reader) (int, error) {
+	if err := os.MkdirAll(s.dest, 0o755); err != nil {
+		return 0, err
+	}
+	files, err := archive.Extract(r, s.dest)
+	return len(files), err
+}
 
 // defaultJVMImage ships the JDK tools (jstack/jcmd/jmap) the dump steps need.
 const defaultJVMImage = "eclipse-temurin:21-jdk"
@@ -121,20 +144,16 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	go func() { _, _ = stdinW.Write([]byte("\n")) }()
 
 	// Default: write one portable .tar.gz. --extract: unpack into a directory.
+	var store Store
 	var report string
-	var artifacts int
-	var consumeErr error
 	if extract {
-		dest := filepath.Join(outDir, base)
-		if consumeErr = os.MkdirAll(dest, 0o755); consumeErr == nil {
-			var files []string
-			files, consumeErr = extractGzTar(stdoutR, dest)
-			artifacts, report = len(files), dest
-		}
+		report = filepath.Join(outDir, base)
+		store = dirStore{dest: report}
 	} else {
 		report = filepath.Join(outDir, base+".tar.gz")
-		artifacts, consumeErr = saveArchive(stdoutR, report)
+		store = archiveStore{path: report}
 	}
+	artifacts, consumeErr := store.Put(stdoutR)
 
 	// We've consumed the full archive; release the trailing read so the container
 	// exits, then drain to EOF so the attach's stdout copy finishes cleanly.
@@ -161,122 +180,16 @@ func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
 	var b strings.Builder
 	b.WriteString(`W="$(mktemp -d)"; `)
 	if thread {
-		fmt.Fprintf(&b, `jstack 1 > "$W/%s.jstack" 2>/dev/null; `, name)
+		_, _ = fmt.Fprintf(&b, `jstack 1 > "$W/%s.jstack" 2>/dev/null; `, name)
 	}
 	if histogram {
-		fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt" 2>/dev/null; `, name)
+		_, _ = fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt" 2>/dev/null; `, name)
 	}
 	if heap {
 		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
 		// back via /proc/1/root (same UID), then stage it in the work dir.
-		fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; `, name, name)
+		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; `, name, name)
 	}
 	b.WriteString(`tar czf - -C "$W" .`)
 	return b.String()
-}
-
-// saveArchive streams the gzipped tar from r into a file at path and returns the
-// number of regular-file entries it contains (0 means the dump produced nothing).
-// It tees the raw bytes to disk while counting entries in a single pass.
-func saveArchive(r io.Reader, path string) (n int, err error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-	}()
-	return countTarEntries(io.TeeReader(r, f))
-}
-
-// countTarEntries reads one gzipped-tar member and counts its regular-file
-// entries. Multistream(false) makes it stop at the member end (not block waiting
-// for stream EOF); the trailing drain consumes the gzip footer so the CRC is
-// validated and (via a TeeReader) the whole member lands on disk.
-func countTarEntries(r io.Reader) (int, error) {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = gz.Close() }()
-
-	gz.Multistream(false)
-	tr := tar.NewReader(gz)
-	n := 0
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return n, err
-		}
-		if hdr.Typeflag == tar.TypeReg {
-			n++
-		}
-	}
-	_, err = io.Copy(io.Discard, gz) // read to the member end → validate footer
-	return n, err
-}
-
-// extractGzTar gunzips one member from r and unpacks its files into dest. The
-// trailing drain reads to the member end so the gzip CRC is validated, turning a
-// truncated stream into an error instead of silent partial output.
-func extractGzTar(r io.Reader, dest string) ([]string, error) {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = gz.Close() }()
-
-	gz.Multistream(false)
-	files, err := extractTar(gz, dest)
-	if err != nil {
-		return files, err
-	}
-	_, err = io.Copy(io.Discard, gz)
-	return files, err
-}
-
-// extractTar writes each regular file from the tar stream into dest (flattened),
-// returning the paths written.
-func extractTar(r io.Reader, dest string) ([]string, error) {
-	tr := tar.NewReader(r)
-	var written []string
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return written, err
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-		out := filepath.Join(dest, filepath.Base(hdr.Name))
-		if err := writeFile(out, tr); err != nil {
-			return written, err
-		}
-		written = append(written, out)
-	}
-	return written, nil
-}
-
-// writeFile creates path and copies r into it, checking the Close error (a
-// failed flush on a write is real data loss).
-func writeFile(path string, r io.Reader) (err error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-	}()
-	_, err = io.Copy(f, r)
-	return err
 }
