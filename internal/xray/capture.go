@@ -3,10 +3,13 @@ package xray
 import (
 	"context"
 	"fmt"
+	"io"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"kubectl-xray/internal/redact"
 )
 
 const defaultContainerAnnotation = "kubectl.kubernetes.io/default-container"
@@ -118,8 +121,22 @@ func (o *Options) capture(ctx context.Context, command []string) error {
 
 	// Stream logs whether it's still running or already finished — the output
 	// is the captured evidence, readable in both cases.
-	if err := streamEphemeralLogs(ctx, o.clientset, o.namespace, pod.Name, ec.Name, o.Out); err != nil {
+	out := io.Writer(o.Out)
+	var rw *redact.Writer
+	if o.redact {
+		rw = redact.NewWriter(o.Out)
+		out = rw
+	}
+	if err := streamEphemeralLogs(ctx, o.clientset, o.namespace, pod.Name, ec.Name, out); err != nil {
 		return err
+	}
+	if rw != nil {
+		if err := rw.Flush(); err != nil {
+			return err
+		}
+		if rw.N > 0 {
+			o.logf("masked %d secret-looking value(s); use --no-redact to disable", rw.N)
+		}
 	}
 	if term != nil && term.ExitCode != 0 {
 		return fmt.Errorf("%s exited %d (%s)", ec.Name, term.ExitCode, term.Reason)

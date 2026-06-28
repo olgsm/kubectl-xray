@@ -49,6 +49,7 @@ into `<output>/<pod>-<timestamp>/`; `env` streams to stdout (pipeable).
 
 1. **Env from a distroless container** ✅ — read `/proc/<pid>/environ` from a
    UID-matched ephemeral toolbox container; no `env`/shell needed in the target.
+   Secret-looking values are masked heuristically by default so they never hit your terminal or logs (`--no-redact` to opt out).
 2. **Capture dumps** ✅ — JVM (jattach/async-profiler) and Go (dlv/pprof) _(planned)_
    under an admission-safe profile.
 3. **Interactive debug shell** ✅ — drop into a UID-matched toolbox container

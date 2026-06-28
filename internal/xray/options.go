@@ -24,6 +24,8 @@ type Options struct {
 
 	asUser       int64
 	userOverride *int64 // set from --run-as-user when explicitly provided
+
+	redact bool // mask secret-looking env values (env command)
 }
 
 func (o *Options) Complete(c *cobra.Command, args []string) error {

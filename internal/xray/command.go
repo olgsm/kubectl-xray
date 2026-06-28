@@ -79,16 +79,19 @@ admission — no need to remember the image, capabilities to drop, or --custom p
 
 func newEnvCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
+	var noRedact bool
 	cmd := &cobra.Command{
 		Use:   "env <pod|deployment>",
 		Short: "Capture the runtime environment of a pod's container",
 		Long:  "Shortcut that reads /proc/1/environ from the target via a debug container.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
+			o.redact = !noRedact
 			return o.runCapture(c, args, envDumpCommand)
 		},
 	}
 	o.addCaptureFlags(cmd, defaultToolboxImage)
+	cmd.Flags().BoolVar(&noRedact, "no-redact", false, "Don't mask secret-looking env values")
 	return cmd
 }
 
