@@ -49,6 +49,25 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 // enabled dump steps against PID 1, and streams a tar of the artifacts into a
 // local timestamped directory.
 func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract bool, outDir string, maxSize int64) error {
+	return o.captureBundle(ctx, "jvm-dump", func(name string) string {
+		return buildJVMDumpScript(thread, histogram, heap, name)
+	}, outDir, extract, maxSize)
+}
+
+// goDump injects a toolbox sharing the target's network namespace and scrapes
+// the app's pprof endpoints over localhost into a local bundle. PoC.
+func (o *Options) goDump(ctx context.Context, port string, goroutine, heap, profile, extract bool, outDir string, maxSize int64) error {
+	return o.captureBundle(ctx, "go-dump", func(name string) string {
+		return buildGoDumpScript(port, goroutine, heap, profile, name)
+	}, outDir, extract, maxSize)
+}
+
+// captureBundle injects a toolbox container running innerScript (which must
+// write a gzipped tar of its artifacts to stdout), streams that tar out, and
+// writes it to a local .tar.gz (or unpacks it with --extract). The script is
+// fenced by reads so its output can't start before we attach or end before we
+// drain it.
+func (o *Options) captureBundle(ctx context.Context, label string, innerScript func(name string) string, outDir string, extract bool, maxSize int64) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err
@@ -64,12 +83,12 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	// Leading read: wait for our go-signal so output can't start before we attach.
 	// Trailing read: stay alive until we close stdin, so the container doesn't exit
 	// and tear down stdout before we've drained it.
-	script := "read _; " + buildJVMDumpScript(thread, histogram, heap, name) + "; read _ || true"
+	script := "read _; " + innerScript(name) + "; read _ || true"
 	ec, err := buildEphemeralContainer(container, o.image, []string{"sh", "-c", script}, true, false, uid, gid)
 	if err != nil {
 		return err
 	}
-	o.logf("injecting jvm-dump toolbox %s (image %s, UID %d)...", ec.Name, o.image, *uid)
+	o.logf("injecting %s toolbox %s (image %s, UID %d)...", label, ec.Name, o.image, *uid)
 	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
 	if err != nil {
 		return err
@@ -86,7 +105,7 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
-	o.logf("capturing dumps (heap can take a while)...")
+	o.logf("capturing dumps...")
 
 	stdoutR, stdoutW := io.Pipe()
 	stdinR, stdinW := io.Pipe()
@@ -134,6 +153,27 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	}
 	o.logf("wrote %s (%d artifacts)", report, artifacts)
 	return nil
+}
+
+// buildGoDumpScript scrapes the app's pprof endpoints on localhost:port into a
+// work dir, then writes a gzipped tar of it to stdout. Requires the app to
+// serve net/http/pprof on that port. wget stderr is left on fd 2 so a refused
+// connection surfaces instead of being swallowed.
+func buildGoDumpScript(port string, goroutine, heap, profile bool, name string) string {
+	var b strings.Builder
+	b.WriteString(`W="$(mktemp -d)"; `)
+	base := "http://localhost:" + port + "/debug/pprof/"
+	if goroutine {
+		_, _ = fmt.Fprintf(&b, `wget -O "$W/%s.goroutine.txt" "%sgoroutine?debug=2"; `, name, base)
+	}
+	if heap {
+		_, _ = fmt.Fprintf(&b, `wget -O "$W/%s.heap.pprof" "%sheap"; `, name, base)
+	}
+	if profile {
+		_, _ = fmt.Fprintf(&b, `wget -O "$W/%s.cpu.pprof" "%sprofile?seconds=10"; `, name, base)
+	}
+	b.WriteString(`tar czf - -C "$W" .`)
+	return b.String()
 }
 
 // buildJVMDumpScript writes each enabled artifact into a work dir, then writes a

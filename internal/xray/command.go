@@ -46,9 +46,52 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 
 	root.AddCommand(newEnvCmd(configFlags, streams))
 	root.AddCommand(newJVMDumpCmd(configFlags, streams))
+	root.AddCommand(newGoDumpCmd(configFlags, streams))
 	root.AddCommand(newDebugCmd(configFlags, streams))
 
 	return root
+}
+
+func newGoDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
+	o := &Options{configFlags: configFlags, IOStreams: streams}
+	var goroutine, heap, profile, extract bool
+	var output, port, maxSize string
+
+	cmd := &cobra.Command{
+		Use:   "go-dump <pod|deployment>",
+		Short: "Capture Go pprof profiles (goroutine, heap, CPU) into a local bundle",
+		Long: `Scrape the app's net/http/pprof endpoints over localhost from a toolbox
+container sharing the pod's network namespace, and stream them into a single
+<output>/<pod>-<timestamp>.tar.gz. Requires the app to serve pprof on --port.
+
+PoC: no delve/core support (those need CAP_SYS_PTRACE).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			if !goroutine && !heap && !profile {
+				return fmt.Errorf("nothing to dump: enable at least one of --goroutine, --heap, --profile")
+			}
+			if err := o.Complete(c, args); err != nil {
+				return err
+			}
+			if err := o.Validate(); err != nil {
+				return err
+			}
+			maxBytes, err := parseMaxSize(maxSize)
+			if err != nil {
+				return err
+			}
+			return o.goDump(c.Context(), port, goroutine, heap, profile, extract, output, maxBytes)
+		},
+	}
+	o.addCaptureFlags(cmd, defaultToolboxImage)
+	cmd.Flags().StringVar(&port, "port", "6060", "Port where the app serves net/http/pprof")
+	cmd.Flags().BoolVar(&goroutine, "goroutine", true, "Capture a goroutine dump (debug=2)")
+	cmd.Flags().BoolVar(&heap, "heap", true, "Capture a heap profile")
+	cmd.Flags().BoolVar(&profile, "profile", false, "Capture a 10s CPU profile")
+	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
+	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
+	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
+	return cmd
 }
 
 func newDebugCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
