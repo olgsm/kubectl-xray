@@ -5,8 +5,8 @@
 
 ### Motivation
 
-Sometimes you need to quickly grep pod's environment, you run `exec -- env | grep` as usual,
-but at this point you might face the burden of **distroless images**, no tools are avaiable inside. 
+Sometimes you need to quickly grep a pod's environment, you run `exec -- env | grep` as usual,
+but at this point you might face the burden of **distroless images**: no tools are available inside. 
 The same goes for collecting dumps and live profiling of a suspicious/failed pod, 
 especially during the incident, when you don't have time to remember which profile is allowed 
 to be attached via `kubectl debug`, or which capabilities you have to drop.
