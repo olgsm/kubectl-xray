@@ -166,7 +166,7 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	defer cancelAttach()
 	attachDone := make(chan error, 1)
 	go func() {
-		err := attachToContainer(attachCtx, o.restConfig, o.clientset, o.namespace, pod.Name, ec.Name, stdinR, stdoutW, &stderr)
+		err := attachToContainer(attachCtx, o.restConfig, o.clientset, o.namespace, pod.Name, ec.Name, stdinR, stdoutW, &stderr, false, nil)
 		_ = stdoutW.CloseWithError(err)
 		attachDone <- err
 	}()

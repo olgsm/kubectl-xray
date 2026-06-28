@@ -40,8 +40,35 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 
 	root.AddCommand(newEnvCmd(configFlags, streams))
 	root.AddCommand(newJVMDumpCmd(configFlags, streams))
+	root.AddCommand(newDebugCmd(configFlags, streams))
 
 	return root
+}
+
+func newDebugCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
+	o := &Options{configFlags: configFlags, IOStreams: streams}
+	var shell string
+	cmd := &cobra.Command{
+		Use:     "debug <pod|deployment>",
+		Aliases: []string{"sh"},
+		Short:   "Open an interactive shell in a debug container beside the target",
+		Long: `Drop into a shell in a toolbox container that shares the target's PID
+namespace and runs as its matching UID, under a restricted profile that passes
+admission — no need to remember the image, capabilities to drop, or --custom profile.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			if err := o.Complete(c, args); err != nil {
+				return err
+			}
+			if err := o.Validate(); err != nil {
+				return err
+			}
+			return o.debug(c.Context(), []string{shell})
+		},
+	}
+	o.addCaptureFlags(cmd, defaultToolboxImage)
+	cmd.Flags().StringVar(&shell, "shell", "sh", "Shell to launch in the debug container")
+	return cmd
 }
 
 func newEnvCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {

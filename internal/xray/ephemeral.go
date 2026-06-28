@@ -169,6 +169,18 @@ func injectEphemeralContainer(ctx context.Context, client kubernetes.Interface, 
 	return updated, nil
 }
 
+// isWaitingFailure reports whether a Waiting reason is terminal (the container
+// will never run) rather than transient (still pulling/creating). A missing
+// shell binary, for instance, surfaces as StartError, not a Terminated state.
+func isWaitingFailure(reason string) bool {
+	switch reason {
+	case "StartError", "RunContainerError", "CreateContainerError",
+		"CreateContainerConfigError", "ErrImagePull", "ImagePullBackOff", "InvalidImageName":
+		return true
+	}
+	return false
+}
+
 // waitForEphemeralStart blocks until the named ephemeral container has started:
 // it returns a nil terminal state once the container is Running, or its terminal
 // state if it already finished (a fast one-shot command can exit before we
@@ -202,6 +214,8 @@ func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, nam
 					return nil, nil
 				case st.State.Terminated != nil:
 					return st.State.Terminated, nil
+				case st.State.Waiting != nil && isWaitingFailure(st.State.Waiting.Reason):
+					return nil, fmt.Errorf("%s failed to start: %s: %s", ecName, st.State.Waiting.Reason, st.State.Waiting.Message)
 				}
 			}
 		}
@@ -211,7 +225,7 @@ func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, nam
 // attachToContainer attaches to a running container's stdio over a binary-safe stream.
 // Feeding stdin lets the container's command block on `read _; ...` until we're connected;
 // a trick is needed to guarantee that we don't miss its stdout (i.e., to avoid the race upon attach).
-func attachToContainer(ctx context.Context, restConfig *rest.Config, client kubernetes.Interface, namespace, podName, containerName string, stdin io.Reader, stdout, stderr io.Writer) error {
+func attachToContainer(ctx context.Context, restConfig *rest.Config, client kubernetes.Interface, namespace, podName, containerName string, stdin io.Reader, stdout, stderr io.Writer, tty bool, sizeQueue remotecommand.TerminalSizeQueue) error {
 	req := client.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
@@ -222,7 +236,8 @@ func attachToContainer(ctx context.Context, restConfig *rest.Config, client kube
 			Container: containerName,
 			Stdin:     stdin != nil,
 			Stdout:    true,
-			Stderr:    true,
+			Stderr:    !tty, // stderr goes into stdout
+			TTY:       tty,
 		}, scheme.ParameterCodec)
 
 	ws, err := remotecommand.NewWebSocketExecutor(restConfig, "GET", req.URL().String())
@@ -240,7 +255,13 @@ func attachToContainer(ctx context.Context, restConfig *rest.Config, client kube
 		return fmt.Errorf("creating fallback executor: %w", err)
 	}
 
-	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdin: stdin, Stdout: stdout, Stderr: stderr})
+	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:             stdin,
+		Stdout:            stdout,
+		Stderr:            stderr,
+		Tty:               tty,
+		TerminalSizeQueue: sizeQueue,
+	})
 }
 
 // streamEphemeralLogs follows the container's stdout into out, capturing it

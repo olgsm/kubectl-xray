@@ -1,14 +1,15 @@
 # kubectl-xray
 
-> A kubectl plugin to inspect pods and capture execution evidence — even on distroless images — via ephemeral debug containers.
+> A kubectl plugin to inspect pods and capture execution evidence via ephemeral debug containers. 
+> Even on distroless images, without headaches.
 
 ### Motivation
 
-Sometimes you want to quickly grep pod's environment, you run `exec -- env | grep` as usual,
-but at this point you might face the burden of **distroless containers**. The same goes for
-collecting dumps and live profiling of a suspicious/failed pod, especially during the incident, 
-when you don't have time to remember which profile is allowed to be attached via `kubectl debug`,
-or which capabilities you have to drop.
+Sometimes you need to quickly grep pod's environment, you run `exec -- env | grep` as usual,
+but at this point you might face the burden of **distroless images**, no tools are avaiable inside. 
+The same goes for collecting dumps and live profiling of a suspicious/failed pod, 
+especially during the incident, when you don't have time to remember which profile is allowed 
+to be attached via `kubectl debug`, or which capabilities you have to drop.
 
 Besides that, `kubectl debug` itself leaves no durable record: `EphemeralContainerStatus` has no
 `lastState` field, so a session's termination context — exit code, duration, `--target` container,
@@ -32,6 +33,9 @@ kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dump
 
 # env reads the target's /proc/1/environ (works on distroless)
 kubectl xray env <pod|deployment> -n <namespace> [-c <container>]
+
+# open an interactive shell in a debug container beside the target
+kubectl xray debug <pod|deployment> -n <namespace> [-c <container>] [--shell sh]
 ```
 
 Commands run in a **toolbox image** (`--image`) injected alongside the target,
@@ -47,6 +51,10 @@ into `<output>/<pod>-<timestamp>/`; `env` streams to stdout (pipeable).
    UID-matched ephemeral toolbox container; no `env`/shell needed in the target.
 2. **Capture dumps** ✅ — JVM (jattach/async-profiler) and Go (dlv/pprof) _(planned)_
    under an admission-safe profile.
-3. **Preserve + share sessions** _(planned)_ — capture termination context via a
-   watch on the `Terminated` transition (before it's overwritten); save output +
-   dumps; share a link; attach to an incident.
+3. **Interactive debug shell** ✅ — drop into a UID-matched toolbox container
+   sharing the target's PID namespace, no need to recall the image/caps/profile.
+4. **Preserve + share sessions** _(planned)_ — capture termination context, save output +
+   dumps to S3 storage; share a link; attach to an incident.
+5. **Smart toolbox image** _(planned, idea)_ — pick the image from the tools you ask for
+   (`--tools jstack,tcpdump` → `some internal kubectl-toolkit`/`netshoot`/…) instead of always
+   defaulting to busybox; allow adding/choosing quickly; infer and honor the cluster's admission constraints.
