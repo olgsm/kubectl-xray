@@ -10,11 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/genericiooptions"
-
 	"kubectl-xray/internal/archive"
 )
 
@@ -48,69 +43,6 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 	}
 	files, err := archive.Extract(r, s.dest, s.maxSize)
 	return len(files), err
-}
-
-// defaultJVMImage ships the JDK tools (jstack/jcmd/jmap) the dump steps need.
-const defaultJVMImage = "eclipse-temurin:21-jdk"
-
-func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
-	o := &Options{configFlags: configFlags, IOStreams: streams}
-	var thread, histogram, heap, extract bool
-	var output, maxSize string
-
-	cmd := &cobra.Command{
-		Use:   "jvm-dump <pod|deployment>",
-		Short: "Capture JVM dumps (thread, GC histogram, heap) into a local bundle",
-		Long: `Run JVM diagnostics against the target's PID 1 from a JDK toolbox container
-that shares its PID namespace and runs as the matching UID. Artifacts are
-streamed out (binary-safe) as a single <output>/<pod>-<timestamp>.tar.gz —
-easy to share or attach to an incident. Use --extract to unpack into a
-directory instead, and --max-size to fail rather than fill local disk on a
-multi-GB heap.
-
-JFR profiling is not included yet.`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(c *cobra.Command, args []string) error {
-			if !thread && !histogram && !heap {
-				return fmt.Errorf("nothing to dump: enable at least one of --thread, --histogram, --heap")
-			}
-			if err := o.Complete(c, args); err != nil {
-				return err
-			}
-			if err := o.Validate(); err != nil {
-				return err
-			}
-			maxBytes, err := parseMaxSize(maxSize)
-			if err != nil {
-				return err
-			}
-			return o.jvmDump(c.Context(), thread, histogram, heap, extract, output, maxBytes)
-		},
-	}
-	o.addCaptureFlags(cmd, defaultJVMImage)
-	cmd.Flags().BoolVar(&thread, "thread", true, "Capture a thread dump (jstack)")
-	cmd.Flags().BoolVar(&histogram, "histogram", true, "Capture a GC class histogram (jcmd)")
-	cmd.Flags().BoolVar(&heap, "heap", true, "Capture a heap dump (jmap)")
-	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
-	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
-	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
-	return cmd
-}
-
-// parseMaxSize converts a human-readable size (e.g. "2Gi", "500M") into bytes.
-// An empty string means unlimited (0).
-func parseMaxSize(s string) (int64, error) {
-	if s == "" {
-		return 0, nil
-	}
-	q, err := resource.ParseQuantity(s)
-	if err != nil {
-		return 0, fmt.Errorf("invalid --max-size %q: %w", s, err)
-	}
-	if q.Sign() < 0 {
-		return 0, fmt.Errorf("invalid --max-size %q: must not be negative", s)
-	}
-	return q.Value(), nil
 }
 
 // jvmDump injects a JDK toolbox sharing the target's PID namespace, runs the
