@@ -25,8 +25,8 @@ with RBAC and shareable+expirable links.
 ## Usage
 
 ```sh
-# build & install on PATH
-go build -o kubectl-xray ./cmd/kubectl-xray && mv kubectl-xray /usr/local/bin/
+# build & install on PATH (kubectl discovers kubectl-* binaries as subcommands)
+make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 
 # capture JVM dumps (thread + GC histogram + heap) into a local bundle
 kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dumps
