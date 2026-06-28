@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 
@@ -25,19 +26,27 @@ type Store interface {
 	Put(r io.Reader) (artifacts int, err error)
 }
 
-// archiveStore writes one portable .tar.gz at path.
-type archiveStore struct{ path string }
+// archiveStore writes one portable .tar.gz at path. maxSize caps the bundle in
+// bytes (0 = unlimited).
+type archiveStore struct {
+	path    string
+	maxSize int64
+}
 
-func (s archiveStore) Put(r io.Reader) (int, error) { return archive.Write(r, s.path) }
+func (s archiveStore) Put(r io.Reader) (int, error) { return archive.Write(r, s.path, s.maxSize) }
 
-// dirStore unpacks the dump into dest (the --extract strategy).
-type dirStore struct{ dest string }
+// dirStore unpacks the dump into dest (the --extract strategy). maxSize caps the
+// total extracted bytes (0 = unlimited).
+type dirStore struct {
+	dest    string
+	maxSize int64
+}
 
 func (s dirStore) Put(r io.Reader) (int, error) {
 	if err := os.MkdirAll(s.dest, 0o755); err != nil {
 		return 0, err
 	}
-	files, err := archive.Extract(r, s.dest)
+	files, err := archive.Extract(r, s.dest, s.maxSize)
 	return len(files), err
 }
 
@@ -47,7 +56,7 @@ const defaultJVMImage = "eclipse-temurin:21-jdk"
 func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
 	var thread, histogram, heap, extract bool
-	var output string
+	var output, maxSize string
 
 	cmd := &cobra.Command{
 		Use:   "jvm-dump <pod|deployment>",
@@ -56,7 +65,8 @@ func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericio
 that shares its PID namespace and runs as the matching UID. Artifacts are
 streamed out (binary-safe) as a single <output>/<pod>-<timestamp>.tar.gz —
 easy to share or attach to an incident. Use --extract to unpack into a
-directory instead.
+directory instead, and --max-size to fail rather than fill local disk on a
+multi-GB heap.
 
 JFR profiling is not included yet.`,
 		Args: cobra.ExactArgs(1),
@@ -70,7 +80,11 @@ JFR profiling is not included yet.`,
 			if err := o.Validate(); err != nil {
 				return err
 			}
-			return o.jvmDump(c.Context(), thread, histogram, heap, extract, output)
+			maxBytes, err := parseMaxSize(maxSize)
+			if err != nil {
+				return err
+			}
+			return o.jvmDump(c.Context(), thread, histogram, heap, extract, output, maxBytes)
 		},
 	}
 	o.addCaptureFlags(cmd, defaultJVMImage)
@@ -79,13 +93,30 @@ JFR profiling is not included yet.`,
 	cmd.Flags().BoolVar(&heap, "heap", true, "Capture a heap dump (jmap)")
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
+	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
 	return cmd
+}
+
+// parseMaxSize converts a human-readable size (e.g. "2Gi", "500M") into bytes.
+// An empty string means unlimited (0).
+func parseMaxSize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --max-size %q: %w", s, err)
+	}
+	if q.Sign() < 0 {
+		return 0, fmt.Errorf("invalid --max-size %q: must not be negative", s)
+	}
+	return q.Value(), nil
 }
 
 // jvmDump injects a JDK toolbox sharing the target's PID namespace, runs the
 // enabled dump steps against PID 1, and streams a tar of the artifacts into a
 // local timestamped directory.
-func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract bool, outDir string) error {
+func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract bool, outDir string, maxSize int64) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err
@@ -148,10 +179,10 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 	var report string
 	if extract {
 		report = filepath.Join(outDir, base)
-		store = dirStore{dest: report}
+		store = dirStore{dest: report, maxSize: maxSize}
 	} else {
 		report = filepath.Join(outDir, base+".tar.gz")
-		store = archiveStore{path: report}
+		store = archiveStore{path: report, maxSize: maxSize}
 	}
 	artifacts, consumeErr := store.Put(stdoutR)
 

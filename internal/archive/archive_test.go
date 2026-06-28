@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -71,7 +72,7 @@ func sampleArchive(t *testing.T) []byte {
 func TestExtractTar(t *testing.T) {
 	dest := t.TempDir()
 
-	files, err := extractTar(bytes.NewReader(sampleArchive(t)), dest)
+	files, err := extractTar(bytes.NewReader(sampleArchive(t)), dest, nil)
 	if err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
@@ -107,7 +108,7 @@ func TestExtractTar(t *testing.T) {
 func TestExtractTarBadArchive(t *testing.T) {
 	// >512 bytes of non-tar data forces a header-parse error (not a clean EOF).
 	garbage := strings.Repeat("x", 600)
-	files, err := extractTar(strings.NewReader(garbage), t.TempDir())
+	files, err := extractTar(strings.NewReader(garbage), t.TempDir(), nil)
 	if err == nil {
 		t.Fatalf("want error on invalid archive, got files=%v", files)
 	}
@@ -117,7 +118,7 @@ func TestWriteFile(t *testing.T) {
 	dir := t.TempDir()
 
 	path := filepath.Join(dir, "out.txt")
-	if err := writeFile(path, func(w io.Writer) error {
+	if err := writeFile(path, nil, func(w io.Writer) error {
 		_, err := w.Write([]byte("hello"))
 		return err
 	}); err != nil {
@@ -139,7 +140,7 @@ func TestWriteFile(t *testing.T) {
 
 	// A fill error must leave no file (and no leftover temp) at the path.
 	bad := filepath.Join(dir, "bad.txt")
-	if err := writeFile(bad, func(io.Writer) error { return fs.ErrInvalid }); err == nil {
+	if err := writeFile(bad, nil, func(io.Writer) error { return fs.ErrInvalid }); err == nil {
 		t.Error("want error from failing fill")
 	}
 	if _, err := os.Stat(bad); err == nil {
@@ -152,7 +153,7 @@ func TestWriteAndExtract(t *testing.T) {
 
 	// Write counts regular-file entries and lands the bytes on disk.
 	out := filepath.Join(t.TempDir(), "bundle.tar.gz")
-	n, err := Write(bytes.NewReader(gz), out)
+	n, err := Write(bytes.NewReader(gz), out, 0)
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -162,11 +163,29 @@ func TestWriteAndExtract(t *testing.T) {
 
 	// Extract unpacks the same stream into a directory.
 	dest := t.TempDir()
-	files, err := Extract(bytes.NewReader(gz), dest)
+	files, err := Extract(bytes.NewReader(gz), dest, 0)
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
 	if len(files) != 4 {
 		t.Errorf("Extract files = %d, want 4", len(files))
+	}
+}
+
+func TestMaxSize(t *testing.T) {
+	gz := gzipOf(t, sampleArchive(t))
+
+	// A 1-byte budget can't fit the compressed bundle.
+	out := filepath.Join(t.TempDir(), "bundle.tar.gz")
+	if _, err := Write(bytes.NewReader(gz), out, 1); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("Write err = %v, want ErrTooLarge", err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("over-budget bundle left on disk")
+	}
+
+	// Extract uncompressed bodies total ~58 bytes; a 10-byte budget overflows.
+	if _, err := Extract(bytes.NewReader(gz), t.TempDir(), 10); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("Extract err = %v, want ErrTooLarge", err)
 	}
 }
