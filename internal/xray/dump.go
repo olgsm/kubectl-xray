@@ -151,7 +151,9 @@ func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
 	if heap {
 		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
 		// back via /proc/1/root (same UID), then stage it in the work dir.
-		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; `, name, name)
+		// rm the heap file from the target afterward so we don't leave secrets
+		// (and a multi-GB file) behind in its /tmp.
+		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null 2>&1; cp /proc/1/root/tmp/%s.hprof "$W/" 2>/dev/null; rm -f /proc/1/root/tmp/%s.hprof; `, name, name, name)
 	}
 	b.WriteString(`tar czf - -C "$W" .`)
 	return b.String()
