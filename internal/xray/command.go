@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
@@ -19,6 +20,21 @@ func (o *Options) addCaptureFlags(cmd *cobra.Command, defaultImage string) {
 	cmd.Flags().StringVarP(&o.container, "container", "c", "", "Name of the container")
 	cmd.Flags().StringVar(&o.image, "image", defaultImage, "Toolbox image for the debug container")
 	cmd.Flags().Int64Var(&o.asUser, "run-as-user", 0, "Run the debug container as this UID (overrides the UID derived from the target)")
+}
+
+// resolveSteps makes the dump-step flags additive: naming any of them selects
+// exactly that set, and naming none enables byDefault. Without this the flags
+// would have to default to true, leaving --heap a no-op and --heap=false the
+// only way to say anything.
+func resolveSteps(fs *pflag.FlagSet, names []string, byDefault ...*bool) {
+	for _, n := range names {
+		if fs.Changed(n) {
+			return
+		}
+	}
+	for _, p := range byDefault {
+		*p = true
+	}
 }
 
 // runCapture runs the Complete/Validate/capture lifecycle for a command.
@@ -64,9 +80,13 @@ func newGoDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericioo
 container sharing the pod's network namespace, and stream them into a single
 <output>/<pod>-<timestamp>.tar.gz. Requires the app to serve pprof on --port.
 
+With no step flags the goroutine dump and heap profile are captured; naming
+any of --goroutine, --heap or --profile captures only those.
+
 PoC: no delve/core support (those need CAP_SYS_PTRACE).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
+			resolveSteps(c.Flags(), []string{"goroutine", "heap", "profile"}, &goroutine, &heap)
 			if !goroutine && !heap && !profile {
 				return fmt.Errorf("nothing to dump: enable at least one of --goroutine, --heap, --profile")
 			}
@@ -85,9 +105,9 @@ PoC: no delve/core support (those need CAP_SYS_PTRACE).`,
 	}
 	o.addCaptureFlags(cmd, defaultToolboxImage)
 	cmd.Flags().StringVar(&port, "port", "6060", "Port where the app serves net/http/pprof")
-	cmd.Flags().BoolVar(&goroutine, "goroutine", true, "Capture a goroutine dump (debug=2)")
-	cmd.Flags().BoolVar(&heap, "heap", true, "Capture a heap profile")
-	cmd.Flags().BoolVar(&profile, "profile", false, "Capture a 10s CPU profile")
+	cmd.Flags().BoolVar(&goroutine, "goroutine", false, "Capture a goroutine dump (debug=2)")
+	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap profile")
+	cmd.Flags().BoolVar(&profile, "profile", false, "Capture a 10s CPU profile (opt-in; not part of the default set)")
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
@@ -153,9 +173,13 @@ easy to share or attach to an incident. Use --extract to unpack into a
 directory instead, and --max-size to fail rather than fill local disk on a
 multi-GB heap.
 
+With no step flags all three dumps are captured; naming any of --thread,
+--histogram or --heap captures only those.
+
 JFR profiling is not included yet.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
+			resolveSteps(c.Flags(), []string{"thread", "histogram", "heap"}, &thread, &histogram, &heap)
 			if !thread && !histogram && !heap {
 				return fmt.Errorf("nothing to dump: enable at least one of --thread, --histogram, --heap")
 			}
@@ -173,9 +197,9 @@ JFR profiling is not included yet.`,
 		},
 	}
 	o.addCaptureFlags(cmd, defaultJVMImage)
-	cmd.Flags().BoolVar(&thread, "thread", true, "Capture a thread dump (jstack)")
-	cmd.Flags().BoolVar(&histogram, "histogram", true, "Capture a GC class histogram (jcmd)")
-	cmd.Flags().BoolVar(&heap, "heap", true, "Capture a heap dump (jmap)")
+	cmd.Flags().BoolVar(&thread, "thread", false, "Capture a thread dump (jstack)")
+	cmd.Flags().BoolVar(&histogram, "histogram", false, "Capture a GC class histogram (jcmd)")
+	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap dump (jmap)")
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")

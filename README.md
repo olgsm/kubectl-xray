@@ -31,6 +31,9 @@ make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 # capture JVM dumps (thread + GC histogram + heap) into a local bundle
 kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dumps
 
+# name steps to narrow it down (no step flags = all of them)
+kubectl xray jvm-dump <pod> --heap
+
 # capture Go pprof profiles (needs the app to serve net/http/pprof on --port)
 kubectl xray go-dump <pod|deployment> -n <namespace> --port 6060 [--profile]
 
