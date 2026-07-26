@@ -186,20 +186,54 @@ func isWaitingFailure(reason string) bool {
 // state if it already finished (a fast one-shot command can exit before we
 // observe Running). Callers decide what to do with an early exit.
 func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string) (*corev1.ContainerStateTerminated, error) {
+	var term *corev1.ContainerStateTerminated
+	err := watchEphemeralStatus(ctx, client, namespace, podName, ecName, func(st corev1.ContainerStatus) (bool, error) {
+		switch {
+		case st.State.Running != nil:
+			return true, nil
+		case st.State.Terminated != nil:
+			term = st.State.Terminated
+			return true, nil
+		case st.State.Waiting != nil && isWaitingFailure(st.State.Waiting.Reason):
+			return false, fmt.Errorf("%s failed to start: %s: %s", ecName, st.State.Waiting.Reason, st.State.Waiting.Message)
+		}
+		return false, nil
+	})
+	return term, err
+}
+
+// waitForEphemeralExit blocks until the named ephemeral container has finished,
+// so a capture can be judged by the toolbox's exit code over a channel that
+// survives the stream it wrote its payload to.
+func waitForEphemeralExit(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string) (*corev1.ContainerStateTerminated, error) {
+	var term *corev1.ContainerStateTerminated
+	err := watchEphemeralStatus(ctx, client, namespace, podName, ecName, func(st corev1.ContainerStatus) (bool, error) {
+		if st.State.Terminated == nil {
+			return false, nil
+		}
+		term = st.State.Terminated
+		return true, nil
+	})
+	return term, err
+}
+
+// watchEphemeralStatus watches the pod and feeds the named ephemeral container's
+// status to check until it reports done (or errors).
+func watchEphemeralStatus(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string, check func(corev1.ContainerStatus) (bool, error)) error {
 	sel := fields.OneTermEqualSelector("metadata.name", podName).String()
 	w, err := client.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{FieldSelector: sel})
 	if err != nil {
-		return nil, fmt.Errorf("watching pod %s/%s: %w", namespace, podName, err)
+		return fmt.Errorf("watching pod %s/%s: %w", namespace, podName, err)
 	}
 	defer w.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case ev, ok := <-w.ResultChan():
 			if !ok {
-				return nil, fmt.Errorf("watch closed before %s started", ecName)
+				return fmt.Errorf("watch closed while waiting on %s", ecName)
 			}
 			pod, ok := ev.Object.(*corev1.Pod)
 			if !ok {
@@ -209,13 +243,12 @@ func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, nam
 				if st.Name != ecName {
 					continue
 				}
-				switch {
-				case st.State.Running != nil:
-					return nil, nil
-				case st.State.Terminated != nil:
-					return st.State.Terminated, nil
-				case st.State.Waiting != nil && isWaitingFailure(st.State.Waiting.Reason):
-					return nil, fmt.Errorf("%s failed to start: %s: %s", ecName, st.State.Waiting.Reason, st.State.Waiting.Message)
+				done, err := check(st)
+				if err != nil {
+					return err
+				}
+				if done {
+					return nil
 				}
 			}
 		}

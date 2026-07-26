@@ -13,6 +13,10 @@ import (
 	"kubectl-xray/internal/archive"
 )
 
+// exitWait bounds how long we wait for the toolbox to report its exit code once
+// we've closed its stdin; it only has the trailing read left to do.
+const exitWait = 60 * time.Second
+
 // Store persists a captured dump stream. Named for persistence so a future
 // backend (e.g. an S3 uploader) can satisfy it alongside the local strategies.
 type Store interface {
@@ -51,7 +55,17 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract bool, outDir string, maxSize int64) error {
 	return o.captureBundle(ctx, "jvm-dump", func(name string) string {
 		return buildJVMDumpScript(thread, histogram, heap, name)
-	}, outDir, extract, maxSize)
+	}, countTrue(thread, histogram, heap), outDir, extract, maxSize)
+}
+
+func countTrue(flags ...bool) int {
+	n := 0
+	for _, f := range flags {
+		if f {
+			n++
+		}
+	}
+	return n
 }
 
 // goDump injects a toolbox sharing the target's network namespace and scrapes
@@ -59,15 +73,22 @@ func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract 
 func (o *Options) goDump(ctx context.Context, port string, goroutine, heap, profile, extract bool, outDir string, maxSize int64) error {
 	return o.captureBundle(ctx, "go-dump", func(name string) string {
 		return buildGoDumpScript(port, goroutine, heap, profile, name)
-	}, outDir, extract, maxSize)
+	}, countTrue(goroutine, heap, profile), outDir, extract, maxSize)
 }
+
+// keepalive emits a NUL on stderr every 20s. A dump tool can work silently for
+// minutes (jmap on a large heap), and an attach stream with no traffic gets
+// dropped by middleboxes between us and the apiserver — which used to kill the
+// capture mid-flight. The NULs are stripped before stderr is reported.
+const keepalive = `(while :; do sleep 20; printf '\000' >&2; done) & HB=$!; trap 'kill $HB 2>/dev/null || true' EXIT; `
 
 // captureBundle injects a toolbox container running innerScript (which must
 // write a gzipped tar of its artifacts to stdout), streams that tar out, and
 // writes it to a local .tar.gz (or unpacks it with --extract). The script is
 // fenced by reads so its output can't start before we attach or end before we
-// drain it.
-func (o *Options) captureBundle(ctx context.Context, label string, innerScript func(name string) string, outDir string, extract bool, maxSize int64) error {
+// drain it. want is the number of artifacts the enabled flags should produce;
+// the capture fails unless the toolbox exits 0 and delivers exactly that many.
+func (o *Options) captureBundle(ctx context.Context, label string, innerScript func(name string) string, want int, outDir string, extract bool, maxSize int64) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err
@@ -82,13 +103,14 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 
 	// Leading read: wait for our go-signal so output can't start before we attach.
 	// Trailing read: stay alive until we close stdin, so the container doesn't exit
-	// and tear down stdout before we've drained it.
-	script := "read _; " + innerScript(name) + "; read _ || true"
+	// and tear down stdout before we've drained it. set -e so a failing dump step
+	// aborts with a non-zero exit instead of tarring up whatever it managed to write.
+	script := "set -e; read _; " + keepalive + innerScript(name) + "; read _ || true"
 	ec, err := buildEphemeralContainer(container, o.image, []string{"sh", "-c", script}, true, false, uid, gid)
 	if err != nil {
 		return err
 	}
-	o.logf("injecting %s toolbox %s (image %s, UID %d)...", label, ec.Name, o.image, *uid)
+	o.logf("injecting %s toolbox %s (image %s, UID %d) in %s/%s...", label, ec.Name, o.image, *uid, o.namespace, name)
 	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
 	if err != nil {
 		return err
@@ -142,16 +164,28 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 	_ = stdinW.Close()
 	_, _ = io.Copy(io.Discard, stdoutR)
 
-	// Wait for the attach goroutine.
-	<-attachDone
+	attachErr := <-attachDone
 
-	if consumeErr != nil {
-		return fmt.Errorf("capturing dumps: %w (stderr: %s)", consumeErr, strings.TrimSpace(stderr.String()))
+	// The toolbox's exit code travels over the API, not the stream that carried the
+	// payload, so it still answers "was this dump complete?" after the stream breaks.
+	exitCtx, cancelExit := context.WithTimeout(ctx, exitWait)
+	defer cancelExit()
+	term, exitErr := waitForEphemeralExit(exitCtx, o.clientset, o.namespace, pod.Name, ec.Name)
+
+	msg := strings.TrimSpace(strings.ReplaceAll(stderr.String(), "\x00", ""))
+	switch {
+	case exitErr != nil:
+		return fmt.Errorf("could not confirm %s completed (%v) — treat %s as incomplete (stderr: %s)", ec.Name, exitErr, report, msg)
+	case term.ExitCode != 0:
+		return fmt.Errorf("%s exited %d — dump is incomplete, discard %s (stderr: %s)", ec.Name, term.ExitCode, report, msg)
+	case consumeErr != nil:
+		return fmt.Errorf("capturing dumps: %w (stderr: %s)", consumeErr, msg)
+	case attachErr != nil:
+		return fmt.Errorf("dump stream broke before it was fully read: %w (stderr: %s)", attachErr, msg)
+	case artifacts != want:
+		return fmt.Errorf("expected %d dump artifacts, got %d — discard %s (stderr: %s)", want, artifacts, report, msg)
 	}
-	if artifacts == 0 {
-		return fmt.Errorf("no dump artifacts produced (stderr: %s)", strings.TrimSpace(stderr.String()))
-	}
-	o.logf("wrote %s (%d artifacts)", report, artifacts)
+	o.logf("wrote %s (%d artifacts, toolbox exited 0)", report, artifacts)
 	return nil
 }
 

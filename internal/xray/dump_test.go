@@ -1,9 +1,54 @@
 package xray
 
 import (
+	"bytes"
+	"context"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestCaptureScriptFencing runs the wrapper captureBundle builds around an inner
+// script through a real shell: a failing step must abort before anything reaches
+// stdout, and the keepalive must stay off stdout and not outlive the script.
+func TestCaptureScriptFencing(t *testing.T) {
+	run := func(t *testing.T, inner string) (stdout, stderr string, err error) {
+		t.Helper()
+		script := "set -e; read _; " + keepalive + inner + "; read _ || true"
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", script)
+		cmd.Stdin = strings.NewReader("\n")
+		var out, errb bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		err = cmd.Run()
+		if ctx.Err() != nil {
+			t.Fatalf("script did not exit — keepalive leaked: %v", ctx.Err())
+		}
+		return out.String(), errb.String(), err
+	}
+
+	t.Run("failing step aborts with no payload", func(t *testing.T) {
+		stdout, _, err := run(t, `false; printf payload`)
+		if err == nil {
+			t.Error("want non-zero exit when a dump step fails")
+		}
+		if stdout != "" {
+			t.Errorf("want no stdout after a failed step; got %q", stdout)
+		}
+	})
+
+	t.Run("payload passes through untouched", func(t *testing.T) {
+		stdout, stderr, err := run(t, `printf payload`)
+		if err != nil {
+			t.Fatalf("script failed: %v (stderr %q)", err, stderr)
+		}
+		if stdout != "payload" {
+			t.Errorf("stdout = %q, want %q — keepalive must not write to stdout", stdout, "payload")
+		}
+	})
+}
 
 func TestBuildJVMDumpScript(t *testing.T) {
 	const name = "mypod"
