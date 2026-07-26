@@ -1,26 +1,59 @@
 # kubectl-xray
 
 > A kubectl plugin to inspect pods and capture execution evidence via ephemeral debug containers. 
-> Even on distroless images, without headaches.
+> Works on distroless out-of-the-box.
 
-### Motivation
+## Why
 
-Sometimes you need to quickly grep a pod's environment, you run `exec -- env | grep` as usual,
-but at this point you might face the burden of **distroless images**: no tools are available inside. 
-The same goes for collecting dumps and live profiling of a suspicious/failed pod, 
-especially during the incident, when you don't have time to remember which profile is allowed 
-to be attached via `kubectl debug`, or which capabilities you have to drop.
+When an application pod misbehaves, the first two questions are how it is
+configured and what its process is doing right now. Both are normally answered
+by exec'ing into the container — the one thing a hardened image takes away.
+Distroless and minimal bases ship no shell and no coreutils:
 
-Besides that, `kubectl debug` itself leaves no durable record: `EphemeralContainerStatus` has no
-`lastState` field, so a session's termination context — exit code, duration, `--target` container,
-debug logs — is lost the moment any pod update replaces `State.Terminated`. In some environments, 
-this might even have a compliance impact: PCI-DSS 10.3 / SOC 2 require traceability, and 
-questions like "who looked at what container, for how long" can't be answered from 
-k8s audit logs alone ([source](https://www.cncf.io/blog/2026/05/18/what-kubectl-debug-doesnt-tell-you-the-silent-evidence-gap/)).
+```sh
+$ kubectl exec -it mypod -- env | grep DB_
+OCI runtime exec failed: exec failed: unable to start container process:
+exec: "env": executable file not found in $PATH
+```
 
-This tool aims to fill this gap — capture introspection output, dumps, and
-session metadata locally. In plans are optional pushes to S3-like storage
-with RBAC and shareable+expirable links.
+Diagnostics fail the same way, and not only on distroless — for example, a JRE-based image
+carries no JDK tooling either, so there is nothing to take a thread or heap dump
+with:
+
+```sh
+$ kubectl exec -it mypod -- jcmd 1 Thread.print
+OCI runtime exec failed: exec failed: unable to start container process:
+exec: "jcmd": executable file not found in $PATH
+```
+
+And a dump you do manage to take is written inside the container, so it still
+has to be streamed out before the pod is replaced — otherwise the evidence goes
+with it.
+
+`kubectl debug` solves the general case, but each invocation requires getting
+the details right — a security profile that passes admission, the capabilities
+to drop, PID namespace sharing, and a UID that matches the target process so
+`/proc` reads and JVM attach work. That is a lot to reconstruct while an
+incident is open.
+
+<details>
+<summary>There is also an evidence gap in <code>kubectl debug</code></summary>
+
+`kubectl debug` leaves no durable record: `EphemeralContainerStatus` has no `lastState` field, so a
+session's termination context — exit code, duration, `--target` container, debug logs — is lost the
+moment any pod update replaces `State.Terminated`. In some environments this has a compliance
+impact: PCI-DSS 10.3 / SOC 2 require traceability, and questions like "who looked at what container,
+for how long" can't be answered from k8s audit logs alone
+([source](https://www.cncf.io/blog/2026/05/18/what-kubectl-debug-doesnt-tell-you-the-silent-evidence-gap/)).
+
+</details>
+
+xray infers the defaults it can and captures the evidence in one line:
+
+```sh
+$ kubectl xray env mypod --no-redact | grep DB_
+$ kubectl xray jvm-dump mypod -o ./dumps
+```
 
 ## Usage
 
@@ -54,6 +87,11 @@ The debug container runs as the target's UID so it can read `/proc/1/...` and
 attach to the JVM; that UID is derived from the pod spec, or set via `--run-as-user`, or is
 auto-discovered by a quick probe when neither is set. `jvm-dump` writes artifacts
 into `<output>/<pod>-<timestamp>/`; `env` streams to stdout (pipeable).
+
+`jvm-dump` defaults to `eclipse-temurin:21-jdk`. The JDK tools attach dynamically
+rather than parsing the target's memory, so they generally work against older
+JVMs; if a step does fail on a version mismatch, point `--image` at a matching
+JDK (`--image eclipse-temurin:17-jdk`).
 
 ## Use cases
 
