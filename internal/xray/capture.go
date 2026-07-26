@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,22 +21,48 @@ const defaultContainerAnnotation = "kubectl.kubernetes.io/default-container"
 // instead of being masked by tr's success at the end of a pipe.
 var envDumpCommand = []string{"sh", "-c", "tr '\\0' '\\n' < /proc/1/environ"}
 
-// resolvePod accepts either a pod name or a deployment name, returning a
-// concrete pod to target (a Running one when resolving via deployment).
+// parseTarget splits kubectl's TYPE/NAME form. An empty kind means the argument
+// was a bare name, which resolves as a pod first and then as a deployment.
+func parseTarget(arg string) (kind, name string, err error) {
+	k, n, ok := strings.Cut(arg, "/")
+	if !ok {
+		return "", arg, nil
+	}
+	if n == "" {
+		return "", "", fmt.Errorf("no resource name in %q", arg)
+	}
+	switch k {
+	case "pod", "pods", "po":
+		return "pod", n, nil
+	case "deployment", "deployments", "deploy":
+		return "deployment", n, nil
+	}
+	return "", "", fmt.Errorf("unsupported resource type %q: use pod/NAME or deployment/NAME", k)
+}
+
+// resolvePod turns the target into a concrete pod, reporting which pod it chose
+// whenever a deployment left it a choice.
 func (o *Options) resolvePod(ctx context.Context) (*corev1.Pod, error) {
 	pods := o.clientset.CoreV1().Pods(o.namespace)
 
-	pod, err := pods.Get(ctx, o.target, metav1.GetOptions{})
-	if err == nil {
-		return pod, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("getting pod %s/%s: %w", o.namespace, o.target, err)
+	if o.kind != "deployment" {
+		pod, err := pods.Get(ctx, o.target, metav1.GetOptions{})
+		if err == nil {
+			return pod, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("getting pod %s/%s: %w", o.namespace, o.target, err)
+		}
+		if o.kind == "pod" {
+			return nil, fmt.Errorf("no pod named %q in namespace %s", o.target, o.namespace)
+		}
 	}
 
-	// Not a pod — try a deployment of that name.
 	dep, derr := o.clientset.AppsV1().Deployments(o.namespace).Get(ctx, o.target, metav1.GetOptions{})
 	if derr != nil {
+		if o.kind == "deployment" {
+			return nil, fmt.Errorf("no deployment named %q in namespace %s", o.target, o.namespace)
+		}
 		return nil, fmt.Errorf("no pod or deployment named %q in namespace %s", o.target, o.namespace)
 	}
 	sel, serr := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
@@ -46,20 +73,42 @@ func (o *Options) resolvePod(ctx context.Context) (*corev1.Pod, error) {
 	if lerr != nil {
 		return nil, fmt.Errorf("listing pods for deployment %s: %w", o.target, lerr)
 	}
-	return pickPod(list.Items, o.target)
+	pod := pickPod(list.Items)
+	if pod == nil {
+		return nil, fmt.Errorf("deployment %q has no pods", o.target)
+	}
+	if len(list.Items) > 1 {
+		o.logf("found %d pods for deployment %s, using pod/%s", len(list.Items), o.target, pod.Name)
+	}
+	return pod, nil
 }
 
-// pickPod prefers a Running pod, falling back to the first one.
-func pickPod(pods []corev1.Pod, deployment string) (*corev1.Pod, error) {
-	if len(pods) == 0 {
-		return nil, fmt.Errorf("deployment %q has no pods", deployment)
-	}
+// pickPod mirrors kubectl's choice for a workload target: a ready Running pod,
+// else any Running one, else anything — newest first among equals.
+func pickPod(pods []corev1.Pod) *corev1.Pod {
+	var best *corev1.Pod
 	for i := range pods {
-		if pods[i].Status.Phase == corev1.PodRunning {
-			return &pods[i], nil
+		p := &pods[i]
+		switch {
+		case best == nil,
+			podRank(p) > podRank(best),
+			podRank(p) == podRank(best) && p.CreationTimestamp.After(best.CreationTimestamp.Time):
+			best = p
 		}
 	}
-	return &pods[0], nil
+	return best
+}
+
+func podRank(p *corev1.Pod) int {
+	if p.Status.Phase != corev1.PodRunning {
+		return 0
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return 2
+		}
+	}
+	return 1
 }
 
 // resolveContainer applies the -c flag, the default-container annotation, then

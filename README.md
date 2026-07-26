@@ -41,6 +41,10 @@ kubectl xray env <pod|deployment> -n <namespace> [-c <container>]
 kubectl xray debug <pod|deployment> -n <namespace> [-c <container>] [--shell sh]
 ```
 
+The target is a pod name, or kubectl's `TYPE/NAME` form (`pod/foo`, `deploy/foo`)
+when a bare name would be ambiguous. Given a deployment, xray picks a ready pod
+(newest among equals) and prints which one it chose.
+
 Commands run in a **toolbox image** (`--image`) injected alongside the target,
 sharing its PID namespace (reach the target's filesystem via `/proc/<pid>/root/`).
 The debug container runs as the target's UID so it can read `/proc/1/...` and

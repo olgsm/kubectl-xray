@@ -18,7 +18,8 @@ type Options struct {
 	restConfig *rest.Config
 
 	namespace string
-	target    string // pod or workload (deployment)
+	kind      string // "pod", "deployment", or "" for a bare name
+	target    string
 	container string
 	image     string
 
@@ -34,7 +35,10 @@ func (o *Options) Complete(c *cobra.Command, args []string) error {
 		return err
 	}
 	o.namespace = ns
-	o.target = args[0]
+	o.kind, o.target, err = parseTarget(args[0])
+	if err != nil {
+		return err
+	}
 
 	if c.Flags().Changed("run-as-user") {
 		o.userOverride = &o.asUser
