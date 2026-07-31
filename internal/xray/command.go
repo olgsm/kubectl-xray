@@ -2,6 +2,7 @@ package xray
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -36,6 +37,24 @@ func resolveSteps(fs *pflag.FlagSet, names []string, byDefault ...*bool) {
 	for _, p := range byDefault {
 		*p = true
 	}
+}
+
+// checkDumpDir rejects the local-output flags when artifacts are being left in
+// the target instead of streamed back, so they fail loudly rather than silently
+// doing nothing.
+func checkDumpDir(fs *pflag.FlagSet, dumpDir string) error {
+	if dumpDir == "" {
+		return nil
+	}
+	if !strings.HasPrefix(dumpDir, "/") {
+		return fmt.Errorf("--dump-dir must be an absolute path in the target, got %q", dumpDir)
+	}
+	for _, n := range []string{"output", "extract", "max-size"} {
+		if fs.Changed(n) {
+			return fmt.Errorf("--%s does not apply with --dump-dir: artifacts stay in the target", n)
+		}
+	}
+	return nil
 }
 
 // runCapture runs the Complete/Validate/capture lifecycle for a command.
@@ -73,7 +92,7 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 func newGoDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
 	var goroutine, heap, profile, extract bool
-	var output, port, maxSize string
+	var output, port, maxSize, dumpDir string
 
 	cmd := &cobra.Command{
 		Use:   "go-dump <pod|deployment>",
@@ -98,11 +117,14 @@ PoC: no delve/core support (those need CAP_SYS_PTRACE).`,
 			if err := o.Validate(); err != nil {
 				return err
 			}
+			if err := checkDumpDir(c.Flags(), dumpDir); err != nil {
+				return err
+			}
 			maxBytes, err := parseMaxSize(maxSize)
 			if err != nil {
 				return err
 			}
-			return o.goDump(c.Context(), port, goroutine, heap, profile, extract, output, maxBytes)
+			return o.goDump(c.Context(), port, goroutine, heap, profile, extract, output, dumpDir, maxBytes)
 		},
 	}
 	o.addCaptureFlags(cmd, defaultToolboxImage)
@@ -113,6 +135,7 @@ PoC: no delve/core support (those need CAP_SYS_PTRACE).`,
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
+	cmd.Flags().StringVar(&dumpDir, "dump-dir", "", "Leave artifacts in this directory inside the target instead of streaming a bundle back")
 	return cmd
 }
 
@@ -190,7 +213,7 @@ Sampling the same pod over time is what turns this into leak evidence.`,
 func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
 	var thread, histogram, heap, vthreads, extract bool
-	var output, maxSize string
+	var output, maxSize, dumpDir string
 	var jfr time.Duration
 
 	cmd := &cobra.Command{
@@ -224,11 +247,14 @@ capture open for its whole duration.`,
 			if err := o.Validate(); err != nil {
 				return err
 			}
+			if err := checkDumpDir(c.Flags(), dumpDir); err != nil {
+				return err
+			}
 			maxBytes, err := parseMaxSize(maxSize)
 			if err != nil {
 				return err
 			}
-			return o.jvmDump(c.Context(), thread, histogram, heap, vthreads, jfr, extract, output, maxBytes)
+			return o.jvmDump(c.Context(), thread, histogram, heap, vthreads, jfr, extract, output, dumpDir, maxBytes)
 		},
 	}
 	o.addCaptureFlags(cmd, defaultJVMImage)
@@ -240,6 +266,7 @@ capture open for its whole duration.`,
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
+	cmd.Flags().StringVar(&dumpDir, "dump-dir", "", "Leave artifacts in this directory inside the target instead of streaming a bundle back")
 	return cmd
 }
 

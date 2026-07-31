@@ -5,36 +5,25 @@
 
 ## Why
 
-When an application pod misbehaves, the first two questions are how it is
-configured and what its process is doing right now. Both are normally answered
-by exec'ing into the container — the one thing a hardened image takes away.
-Distroless and minimal bases ship no shell and no coreutils:
+When a pod misbehaves, you generally want two things: its config, and what the process is
+doing right now. Normally you just exec into the container. On a hardened image
+you can't — there is no shell and no tools to run:
 
 ```sh
 $ kubectl exec -it mypod -- env | grep DB_
-OCI runtime exec failed: exec failed: unable to start container process:
 exec: "env": executable file not found in $PATH
-```
 
-Diagnostics fail the same way, and not only on distroless — for example, a JRE-based image
-carries no JDK tooling either, so there is nothing to take a thread or heap dump
-with:
-
-```sh
 $ kubectl exec -it mypod -- jcmd 1 Thread.print
-OCI runtime exec failed: exec failed: unable to start container process:
 exec: "jcmd": executable file not found in $PATH
 ```
 
-And a dump you do manage to take is written inside the container, so it still
-has to be streamed out before the pod is replaced — otherwise the evidence goes
-with it.
+This is not only about distroless — a JRE image has no JDK tools either. And if
+you do get a dump, it sits inside the container: you have to copy it out before
+the pod is replaced, or it's gone.
 
-`kubectl debug` solves the general case, but each invocation requires getting
-the details right — a security profile that passes admission, the capabilities
-to drop, PID namespace sharing, and a UID that matches the target process so
-`/proc` reads and JVM attach work. That is a lot to reconstruct while an
-incident is open.
+`kubectl debug` (and `cdebug` too) can help, but you have to get every detail right: a
+security profile your cluster accepts, which capabilities to drop, sharing the
+PID namespace, and the right UID — otherwise `/proc` reads and JVM attach fail.
 
 <details>
 <summary>There is also an evidence gap in <code>kubectl debug</code></summary>
@@ -48,11 +37,11 @@ for how long" can't be answered from k8s audit logs alone
 
 </details>
 
-xray infers the defaults it can and captures the evidence in one line:
+`xray` infers the default values itself and captures the evidence in one line:
 
 ```sh
-$ kubectl xray env mypod --no-redact | grep DB_
-$ kubectl xray jvm-dump mypod -o ./dumps
+$ kubectl xray env mypod --no-redact | grep DB_    # find the DB config
+$ kubectl xray jvm-dump --heap mypod -o ./dumps    # heap dump into a local .tar.gz
 ```
 
 ## Usage
@@ -61,20 +50,14 @@ $ kubectl xray jvm-dump mypod -o ./dumps
 # build & install on PATH (kubectl discovers kubectl-* binaries as subcommands)
 make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 
-# capture JVM dumps (thread + GC histogram + heap) into a local bundle
-kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dumps
+# capture JVM heap dump into a local bundle OR into a volume mounted in the pod
+# (must be writable by the app's UID); note: a heap dump carries secrets and PII!
+kubectl xray jvm-dump <pod> -n <namespace> [-c <container>] --heap -o ./dumps
+kubectl xray jvm-dump <pod> -n <namespace> [-c <container>] --heap --dump-dir /dumps
 
-# name steps to narrow it down (no step flags = thread + histogram)
-kubectl xray jvm-dump <pod> --histogram
-
-# a heap dump is opt-in: the hprof carries secrets and PII, unredactable
-kubectl xray jvm-dump <pod> --heap
-
-# virtual threads are invisible to jstack; JDK 21+ only, so it's opt-in
-kubectl xray jvm-dump <pod> --vthreads
-
-# JFR profiling (settings=profile), also opt-in — the capture waits it out
-kubectl xray jvm-dump <pod> --jfr 60s
+# name dump steps to opt-in (no flags = only threads + histogram)
+kubectl xray jvm-dump <pod> --vthreads   # JDK 21+
+kubectl xray jvm-dump <pod> --jfr 60s    # holds the capture open 60s
 
 # capture Go pprof profiles (needs the app to serve net/http/pprof on --port)
 kubectl xray go-dump <pod|deployment> -n <namespace> --port 6060 [--profile]
@@ -97,8 +80,16 @@ Commands run in a **toolbox image** (`--image`) injected alongside the target,
 sharing its PID namespace (reach the target's filesystem via `/proc/<pid>/root/`).
 The debug container runs as the target's UID so it can read `/proc/1/...` and
 attach to the JVM; that UID is derived from the pod spec, or set via `--run-as-user`, or is
-auto-discovered by a quick probe when neither is set. `jvm-dump` writes artifacts
-into `<output>/<pod>-<timestamp>/`; `env` streams to stdout (pipeable).
+auto-discovered by a quick probe when neither is set. `jvm-dump` and `go-dump`
+write `<output>/<pod>-<timestamp>.tar.gz` (a directory instead with `--extract`,
+or nothing locally with `--dump-dir`); `env` and `info` stream to stdout
+(pipeable).
+
+`--dump-dir` leaves the artifacts in a directory inside the target instead of
+streaming them back — for an uploader that watches it. The directory has to be
+mounted in the pod already and writable by the app's UID; the JVM writes its own
+files (heap, virtual threads, JFR) straight there, so a multi-GB heap is never
+copied twice.
 
 `jvm-dump` defaults to `eclipse-temurin:21-jdk`. The JDK tools attach dynamically
 rather than parsing the target's memory, so they generally work against older

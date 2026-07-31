@@ -91,7 +91,7 @@ func TestBuildJVMDumpScript(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.label, func(t *testing.T) {
-			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, tt.vthreads, tt.jfr, name)
+			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, tt.vthreads, tt.jfr, name, "")
 			if !strings.HasPrefix(got, `W="$(mktemp -d)"; `) {
 				t.Errorf("script must set up a work dir first; got %q", got)
 			}
@@ -109,5 +109,39 @@ func TestBuildJVMDumpScript(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// With --dump-dir the artifacts stay in the target: the JVM writes its own files
+// straight to that path (no staging copy, no rm), the toolbox reaches the same
+// directory through /proc/1/root, and nothing is tarred to stdout.
+func TestBuildJVMDumpScriptDumpDir(t *testing.T) {
+	got := buildJVMDumpScript(true, false, true, true, 30*time.Second, "mypod", "/dumps")
+
+	for _, want := range []string{
+		`W=/proc/1/root/dumps`,
+		`jmap -dump:live,format=b,file=/dumps/mypod.hprof 1`,
+		`Thread.dump_to_file -format=json /dumps/mypod.threads.json`,
+		`filename=/dumps/mypod.jfr`,
+		`ls -l "$W"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %q in script; got %q", want, got)
+		}
+	}
+	for _, unwanted := range []string{"mktemp", "tar czf", "cp /proc/1/root/tmp", "rm -f /proc/1/root/tmp"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("did not want %q with --dump-dir; got %q", unwanted, got)
+		}
+	}
+}
+
+func TestBuildGoDumpScriptDumpDir(t *testing.T) {
+	got := buildGoDumpScript("6060", true, true, false, "mypod", "/dumps")
+	if !strings.Contains(got, `W=/proc/1/root/dumps`) || !strings.HasSuffix(got, `ls -l "$W"`) {
+		t.Errorf("want the target dir as work dir and no tar; got %q", got)
+	}
+	if strings.Contains(got, "tar czf") {
+		t.Errorf("did not want a tar with --dump-dir; got %q", got)
 	}
 }

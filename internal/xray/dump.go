@@ -51,14 +51,32 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 
 // jvmDump injects a JDK toolbox sharing the target's PID namespace, runs the
 // enabled dump steps against PID 1, and streams a tar of the artifacts into a
-// local timestamped directory.
-func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, vthreads bool, jfr time.Duration, extract bool, outDir string, maxSize int64) error {
+// local timestamped directory — or, with dumpDir, leaves them in a directory
+// mounted inside the target.
+func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, vthreads bool, jfr time.Duration, extract bool, outDir, dumpDir string, maxSize int64) error {
 	if heap {
 		o.logf("warning: the heap dump holds whatever the process has in memory — credentials, tokens, customer data — and is not redacted")
 	}
-	return o.captureBundle(ctx, "jvm-dump", func(name string) string {
-		return buildJVMDumpScript(thread, histogram, heap, vthreads, jfr, name)
-	}, countTrue(thread, histogram, heap, vthreads, jfr > 0), outDir, extract, maxSize)
+	script := func(name string) string {
+		return buildJVMDumpScript(thread, histogram, heap, vthreads, jfr, name, dumpDir)
+	}
+	if dumpDir != "" {
+		return o.captureInPod(ctx, "jvm-dump", script, dumpDir)
+	}
+	return o.captureBundle(ctx, "jvm-dump", script, countTrue(thread, histogram, heap, vthreads, jfr > 0), outDir, extract, maxSize)
+}
+
+// captureInPod runs the dump steps but leaves the artifacts in dumpDir inside
+// the target, for whatever watches that directory to pick them up.
+// Nothing is streamed back except the script's progress output.
+func (o *Options) captureInPod(ctx context.Context, label string, innerScript func(name string) string, dumpDir string) error {
+	pod, err := o.resolvePod(ctx)
+	if err != nil {
+		return err
+	}
+	o.logf("%s: writing artifacts into %s inside %s/%s; nothing is streamed out", label, dumpDir, o.namespace, pod.Name)
+	name := fmt.Sprintf("%s-%s", pod.Name, time.Now().Format("2006-01-02_15-04-05"))
+	return o.captureOn(ctx, pod, []string{"sh", "-c", "set -e; " + innerScript(name)})
 }
 
 func countTrue(flags ...bool) int {
@@ -73,10 +91,14 @@ func countTrue(flags ...bool) int {
 
 // goDump injects a toolbox sharing the target's network namespace and scrapes
 // the app's pprof endpoints over localhost into a local bundle. PoC.
-func (o *Options) goDump(ctx context.Context, port string, goroutine, heap, profile, extract bool, outDir string, maxSize int64) error {
-	return o.captureBundle(ctx, "go-dump", func(name string) string {
-		return buildGoDumpScript(port, goroutine, heap, profile, name)
-	}, countTrue(goroutine, heap, profile), outDir, extract, maxSize)
+func (o *Options) goDump(ctx context.Context, port string, goroutine, heap, profile, extract bool, outDir, dumpDir string, maxSize int64) error {
+	script := func(name string) string {
+		return buildGoDumpScript(port, goroutine, heap, profile, name, dumpDir)
+	}
+	if dumpDir != "" {
+		return o.captureInPod(ctx, "go-dump", script, dumpDir)
+	}
+	return o.captureBundle(ctx, "go-dump", script, countTrue(goroutine, heap, profile), outDir, extract, maxSize)
 }
 
 // keepalive emits a NUL on stderr every 20s. A dump tool can work silently for
@@ -192,13 +214,32 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 	return nil
 }
 
+// workDirFor opens a dump script by pointing $W at the destination: a private
+// staging dir when the bundle is streamed back, or — with dumpDir — the target's
+// own directory, reached through its mount namespace via /proc/1/root.
+func workDirFor(dumpDir string) string {
+	if dumpDir == "" {
+		return `W="$(mktemp -d)"; `
+	}
+	return fmt.Sprintf(`W=/proc/1/root%s; [ -d "$W" ] || { echo "%s is not a directory in the target" >&2; exit 1; }; `, dumpDir, dumpDir)
+}
+
+// tailFor closes a dump script: tar the staging dir to stdout, or just list what
+// was left in the target's directory.
+func tailFor(dumpDir string) string {
+	if dumpDir == "" {
+		return `tar czf - -C "$W" .`
+	}
+	return `ls -l "$W"`
+}
+
 // buildGoDumpScript scrapes the app's pprof endpoints on localhost:port into a
 // work dir, then writes a gzipped tar of it to stdout. Requires the app to
 // serve net/http/pprof on that port. wget stderr is left on fd 2 so a refused
 // connection surfaces instead of being swallowed.
-func buildGoDumpScript(port string, goroutine, heap, profile bool, name string) string {
+func buildGoDumpScript(port string, goroutine, heap, profile bool, name, dumpDir string) string {
 	var b strings.Builder
-	b.WriteString(`W="$(mktemp -d)"; `)
+	b.WriteString(workDirFor(dumpDir))
 	base := "http://localhost:" + port + "/debug/pprof/"
 	if goroutine {
 		_, _ = fmt.Fprintf(&b, `wget -O "$W/%s.goroutine.txt" "%sgoroutine?debug=2"; `, name, base)
@@ -209,16 +250,22 @@ func buildGoDumpScript(port string, goroutine, heap, profile bool, name string) 
 	if profile {
 		_, _ = fmt.Fprintf(&b, `wget -O "$W/%s.cpu.pprof" "%sprofile?seconds=10"; `, name, base)
 	}
-	b.WriteString(`tar czf - -C "$W" .`)
+	b.WriteString(tailFor(dumpDir))
 	return b.String()
 }
 
 // buildJVMDumpScript writes each enabled artifact into a work dir, then writes a
 // gzipped tar of it to stdout. Only tar writes to stdout; tool chatter is
 // redirected away.
-func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duration, name string) string {
+func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duration, name, dumpDir string) string {
 	var b strings.Builder
-	b.WriteString(`W="$(mktemp -d)"; `)
+	b.WriteString(workDirFor(dumpDir))
+	// jvmPath is how the target JVM addresses the destination; jvmSeen is how the
+	// toolbox sees the files the JVM writes there.
+	jvmPath, jvmSeen := "/tmp", "/proc/1/root/tmp"
+	if dumpDir != "" {
+		jvmPath, jvmSeen = dumpDir, `"$W"`
+	}
 	// Each tool's stdout goes to a file (or /dev/null); stderr is left on fd 2 so
 	// failures (e.g. a read-only /tmp) reach the client instead of being swallowed.
 	// Only tar writes to stdout.
@@ -230,26 +277,31 @@ func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duratio
 	}
 	if vthreads {
 		// Virtual threads don't appear in a jstack dump; Thread.dump_to_file (JDK 21+)
-		// is the only view of them. Like jmap, the JVM writes the file into its own
-		// filesystem, so stage it back through /proc/1/root and clean up after.
-		_, _ = fmt.Fprintf(&b, `jcmd 1 Thread.dump_to_file -format=json /tmp/%s.threads.json >/dev/null; cp /proc/1/root/tmp/%s.threads.json "$W/"; rm -f /proc/1/root/tmp/%s.threads.json; `, name, name, name)
+		// is the only view of them.
+		_, _ = fmt.Fprintf(&b, `jcmd 1 Thread.dump_to_file -format=json %s/%s.threads.json >/dev/null; `, jvmPath, name)
+		if dumpDir == "" {
+			_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.threads.json "$W/"; rm -f /proc/1/root/tmp/%s.threads.json; `, name, name)
+		}
 	}
 	if heap {
-		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
-		// back via /proc/1/root (same UID), then stage it in the work dir.
-		// rm the heap file from the target afterward so we don't leave secrets
-		// (and a multi-GB file) behind in its /tmp.
-		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null; cp /proc/1/root/tmp/%s.hprof "$W/"; rm -f /proc/1/root/tmp/%s.hprof; `, name, name, name)
+		// The JVM writes the .hprof into its own filesystem. When staging, read it
+		// back via /proc/1/root (same UID) and rm it afterwards so we don't leave
+		// secrets (and a multi-GB file) behind in the target's /tmp.
+		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=%s/%s.hprof 1 >/dev/null; `, jvmPath, name)
+		if dumpDir == "" {
+			_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.hprof "$W/"; rm -f /proc/1/root/tmp/%s.hprof; `, name, name)
+		}
 	}
 	if jfr > 0 {
-		// The recording stops itself after duration= and only then writes the file,
-		// which the JVM puts in its own /tmp. Poll for it rather than guessing a
-		// margin, then stage it back and clean up.
+		// The recording stops itself after duration= and only then writes the file.
+		// Poll for it rather than guessing a margin.
 		secs := int(jfr.Seconds())
-		_, _ = fmt.Fprintf(&b, `jcmd 1 JFR.start name=xray settings=profile duration=%ds filename=/tmp/%s.jfr >/dev/null; sleep %d; `, secs, name, secs)
-		_, _ = fmt.Fprintf(&b, `i=0; while [ ! -f /proc/1/root/tmp/%s.jfr ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; `, name)
-		_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.jfr "$W/"; rm -f /proc/1/root/tmp/%s.jfr; `, name, name)
+		_, _ = fmt.Fprintf(&b, `jcmd 1 JFR.start name=xray settings=profile duration=%ds filename=%s/%s.jfr >/dev/null; sleep %d; `, secs, jvmPath, name, secs)
+		_, _ = fmt.Fprintf(&b, `i=0; while [ ! -f %s/%s.jfr ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; `, jvmSeen, name)
+		if dumpDir == "" {
+			_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.jfr "$W/"; rm -f /proc/1/root/tmp/%s.jfr; `, name, name)
+		}
 	}
-	b.WriteString(`tar czf - -C "$W" .`)
+	b.WriteString(tailFor(dumpDir))
 	return b.String()
 }

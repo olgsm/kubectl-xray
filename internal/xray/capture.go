@@ -148,6 +148,13 @@ func (o *Options) capture(ctx context.Context, command []string) error {
 	if err != nil {
 		return err
 	}
+	return o.captureOn(ctx, pod, command)
+}
+
+// captureOn is capture against an already-resolved pod, so a caller that needs
+// the pod's identity first doesn't resolve it twice (and risk landing on a
+// different replica the second time).
+func (o *Options) captureOn(ctx context.Context, pod *corev1.Pod, command []string) error {
 	container := o.resolveContainer(pod)
 
 	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
