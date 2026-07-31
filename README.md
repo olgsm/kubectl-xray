@@ -73,6 +73,9 @@ kubectl xray go-dump <pod|deployment> -n <namespace> --port 6060 [--profile]
 # env reads the target's /proc/1/environ (works on distroless)
 kubectl xray env <pod|deployment> -n <namespace> [-c <container>]
 
+# process, memory, cgroup limits and fd usage; optionally scrape app metrics
+kubectl xray info <pod|deployment> -n <namespace> [--metrics-port 8080]
+
 # open an interactive shell in a debug container beside the target
 kubectl xray debug <pod|deployment> -n <namespace> [-c <container>] [--shell sh]
 ```

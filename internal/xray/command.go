@@ -61,6 +61,7 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 	configFlags.AddFlags(root.PersistentFlags())
 
 	root.AddCommand(newEnvCmd(configFlags, streams))
+	root.AddCommand(newInfoCmd(configFlags, streams))
 	root.AddCommand(newJVMDumpCmd(configFlags, streams))
 	root.AddCommand(newGoDumpCmd(configFlags, streams))
 	root.AddCommand(newDebugCmd(configFlags, streams))
@@ -155,6 +156,33 @@ func newEnvCmd(configFlags *genericclioptions.ConfigFlags, streams genericioopti
 	}
 	o.addCaptureFlags(cmd, defaultToolboxImage)
 	cmd.Flags().BoolVar(&noRedact, "no-redact", false, "Don't mask secret-looking env values")
+	return cmd
+}
+
+func newInfoCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
+	o := &Options{configFlags: configFlags, IOStreams: streams}
+	var noRedact bool
+	var metricsPort, metricsPath string
+	cmd := &cobra.Command{
+		Use:   "info <pod|deployment>",
+		Short: "Report the target process, its memory, cgroup limits and fd usage",
+		Long: `Read what the target process is and what the kernel is enforcing on it —
+command line, thread count, RSS/PSS, cgroup memory and CPU limits, open file
+descriptors — from /proc and the target's own cgroup view. Needs no tooling in
+the target image and no extra capabilities.
+
+With --metrics-port, also scrape the app's metrics endpoint over localhost.
+Sampling the same pod over time is what turns this into leak evidence.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			o.redact = !noRedact
+			return o.runCapture(c, args, buildInfoCommand(metricsPort, metricsPath))
+		},
+	}
+	o.addCaptureFlags(cmd, defaultToolboxImage)
+	cmd.Flags().BoolVar(&noRedact, "no-redact", false, "Don't mask secret-looking values (the command line can carry them)")
+	cmd.Flags().StringVar(&metricsPort, "metrics-port", "", "Also scrape the app's metrics endpoint on this localhost port")
+	cmd.Flags().StringVar(&metricsPath, "metrics-path", "/metrics", "Path of the metrics endpoint")
 	return cmd
 }
 
