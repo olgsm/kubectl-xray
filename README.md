@@ -110,12 +110,16 @@ JDK (`--image eclipse-temurin:17-jdk`).
 1. **Env from a distroless container** ✅ — read `/proc/<pid>/environ` from a
    UID-matched ephemeral toolbox container; no `env`/shell needed in the target.
    Secret-looking values are masked heuristically by default so they never hit your terminal or logs (`--no-redact` to opt out).
-2. **Capture dumps** ✅ — JVM (jattach/async-profiler) and Go (dlv/pprof) _(planned)_
-   under an admission-safe profile.
-3. **Interactive debug shell** ✅ — drop into a UID-matched toolbox container
+2. **Capture dumps** ✅ — JVM (jstack, GC histogram, jmap heap, JDK 21 virtual
+   threads, JFR) and Go (goroutine, heap, CPU pprof), streamed into one verified
+   bundle under an admission-safe profile.
+3. **Runtime facts** ✅ — `info` reports the target's command line, threads,
+   RSS/PSS, cgroup limits and fd usage from `/proc`, and optionally scrapes the
+   app's metrics endpoint over the pod's network namespace.
+4. **Interactive debug shell** ✅ — drop into a UID-matched toolbox container
    sharing the target's PID namespace, no need to recall the image/caps/profile.
-4. **Preserve + share sessions** _(planned)_ — capture termination context, save output +
+5. **Preserve + share sessions** _(planned)_ — capture termination context, save output +
    dumps to S3 storage; share a link; attach to an incident.
-5. **Smart toolbox image** _(planned, idea)_ — pick the image from the tools you ask for
+6. **Smart toolbox image** _(planned)_ — pick the image from the tools you ask for
    (`--tools jstack,tcpdump` → `some internal kubectl-toolkit`/`netshoot`/…) instead of always
    defaulting to busybox; allow adding/choosing quickly; infer and honor the cluster's admission constraints.
