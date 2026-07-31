@@ -64,8 +64,17 @@ make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 # capture JVM dumps (thread + GC histogram + heap) into a local bundle
 kubectl xray jvm-dump <pod|deployment> -n <namespace> [-c <container>] -o ./dumps
 
-# name steps to narrow it down (no step flags = all of them)
+# name steps to narrow it down (no step flags = thread + histogram)
+kubectl xray jvm-dump <pod> --histogram
+
+# a heap dump is opt-in: the hprof carries secrets and PII, unredactable
 kubectl xray jvm-dump <pod> --heap
+
+# virtual threads are invisible to jstack; JDK 21+ only, so it's opt-in
+kubectl xray jvm-dump <pod> --vthreads
+
+# JFR profiling (settings=profile), also opt-in — the capture waits it out
+kubectl xray jvm-dump <pod> --jfr 60s
 
 # capture Go pprof profiles (needs the app to serve net/http/pprof on --port)
 kubectl xray go-dump <pod|deployment> -n <namespace> --port 6060 [--profile]

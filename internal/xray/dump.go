@@ -52,10 +52,13 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 // jvmDump injects a JDK toolbox sharing the target's PID namespace, runs the
 // enabled dump steps against PID 1, and streams a tar of the artifacts into a
 // local timestamped directory.
-func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, extract bool, outDir string, maxSize int64) error {
+func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, vthreads bool, jfr time.Duration, extract bool, outDir string, maxSize int64) error {
+	if heap {
+		o.logf("warning: the heap dump holds whatever the process has in memory — credentials, tokens, customer data — and is not redacted")
+	}
 	return o.captureBundle(ctx, "jvm-dump", func(name string) string {
-		return buildJVMDumpScript(thread, histogram, heap, name)
-	}, countTrue(thread, histogram, heap), outDir, extract, maxSize)
+		return buildJVMDumpScript(thread, histogram, heap, vthreads, jfr, name)
+	}, countTrue(thread, histogram, heap, vthreads, jfr > 0), outDir, extract, maxSize)
 }
 
 func countTrue(flags ...bool) int {
@@ -213,7 +216,7 @@ func buildGoDumpScript(port string, goroutine, heap, profile bool, name string) 
 // buildJVMDumpScript writes each enabled artifact into a work dir, then writes a
 // gzipped tar of it to stdout. Only tar writes to stdout; tool chatter is
 // redirected away.
-func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
+func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duration, name string) string {
 	var b strings.Builder
 	b.WriteString(`W="$(mktemp -d)"; `)
 	// Each tool's stdout goes to a file (or /dev/null); stderr is left on fd 2 so
@@ -225,12 +228,27 @@ func buildJVMDumpScript(thread, histogram, heap bool, name string) string {
 	if histogram {
 		_, _ = fmt.Fprintf(&b, `jcmd 1 GC.class_histogram > "$W/%s.histogram.txt"; `, name)
 	}
+	if vthreads {
+		// Virtual threads don't appear in a jstack dump; Thread.dump_to_file (JDK 21+)
+		// is the only view of them. Like jmap, the JVM writes the file into its own
+		// filesystem, so stage it back through /proc/1/root and clean up after.
+		_, _ = fmt.Fprintf(&b, `jcmd 1 Thread.dump_to_file -format=json /tmp/%s.threads.json >/dev/null; cp /proc/1/root/tmp/%s.threads.json "$W/"; rm -f /proc/1/root/tmp/%s.threads.json; `, name, name, name)
+	}
 	if heap {
 		// The JVM writes the .hprof into its own filesystem (target /tmp); read it
 		// back via /proc/1/root (same UID), then stage it in the work dir.
 		// rm the heap file from the target afterward so we don't leave secrets
 		// (and a multi-GB file) behind in its /tmp.
 		_, _ = fmt.Fprintf(&b, `jmap -dump:live,format=b,file=/tmp/%s.hprof 1 >/dev/null; cp /proc/1/root/tmp/%s.hprof "$W/"; rm -f /proc/1/root/tmp/%s.hprof; `, name, name, name)
+	}
+	if jfr > 0 {
+		// The recording stops itself after duration= and only then writes the file,
+		// which the JVM puts in its own /tmp. Poll for it rather than guessing a
+		// margin, then stage it back and clean up.
+		secs := int(jfr.Seconds())
+		_, _ = fmt.Fprintf(&b, `jcmd 1 JFR.start name=xray settings=profile duration=%ds filename=/tmp/%s.jfr >/dev/null; sleep %d; `, secs, name, secs)
+		_, _ = fmt.Fprintf(&b, `i=0; while [ ! -f /proc/1/root/tmp/%s.jfr ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; `, name)
+		_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.jfr "$W/"; rm -f /proc/1/root/tmp/%s.jfr; `, name, name)
 	}
 	b.WriteString(`tar czf - -C "$W" .`)
 	return b.String()

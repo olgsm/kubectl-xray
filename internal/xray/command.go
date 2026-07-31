@@ -2,6 +2,7 @@ package xray
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -188,12 +189,13 @@ Sampling the same pod over time is what turns this into leak evidence.`,
 
 func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
-	var thread, histogram, heap, extract bool
+	var thread, histogram, heap, vthreads, extract bool
 	var output, maxSize string
+	var jfr time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "jvm-dump <pod|deployment>",
-		Short: "Capture JVM dumps (thread, GC histogram, heap) into a local bundle",
+		Short: "Capture JVM dumps (thread, GC histogram, heap, JFR) into a local bundle",
 		Long: `Run JVM diagnostics against the target's PID 1 from a JDK toolbox container
 that shares its PID namespace and runs as the matching UID. Artifacts are
 streamed out (binary-safe) as a single <output>/<pod>-<timestamp>.tar.gz —
@@ -201,15 +203,20 @@ easy to share or attach to an incident. Use --extract to unpack into a
 directory instead, and --max-size to fail rather than fill local disk on a
 multi-GB heap.
 
-With no step flags all three dumps are captured; naming any of --thread,
---histogram or --heap captures only those.
+With no step flags the thread dump and GC histogram are captured; naming any
+step captures only those.
 
-JFR profiling is not included yet.`,
+--heap, --vthreads and --jfr are opt-in. A heap dump is excluded from the
+default set on purpose: an hprof contains whatever the process holds in
+memory — credentials, tokens, customer data — and cannot be redacted the way
+'xray env' masks its output. Ask for it deliberately, and handle the bundle
+accordingly. Virtual thread dumps need JDK 21+, and a JFR recording holds the
+capture open for its whole duration.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			resolveSteps(c.Flags(), []string{"thread", "histogram", "heap"}, &thread, &histogram, &heap)
-			if !thread && !histogram && !heap {
-				return fmt.Errorf("nothing to dump: enable at least one of --thread, --histogram, --heap")
+			resolveSteps(c.Flags(), []string{"thread", "histogram", "heap", "vthreads", "jfr"}, &thread, &histogram)
+			if !thread && !histogram && !heap && !vthreads && jfr == 0 {
+				return fmt.Errorf("nothing to dump: enable at least one of --thread, --histogram, --heap, --vthreads, --jfr")
 			}
 			if err := o.Complete(c, args); err != nil {
 				return err
@@ -221,13 +228,15 @@ JFR profiling is not included yet.`,
 			if err != nil {
 				return err
 			}
-			return o.jvmDump(c.Context(), thread, histogram, heap, extract, output, maxBytes)
+			return o.jvmDump(c.Context(), thread, histogram, heap, vthreads, jfr, extract, output, maxBytes)
 		},
 	}
 	o.addCaptureFlags(cmd, defaultJVMImage)
 	cmd.Flags().BoolVar(&thread, "thread", false, "Capture a thread dump (jstack)")
 	cmd.Flags().BoolVar(&histogram, "histogram", false, "Capture a GC class histogram (jcmd)")
-	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap dump (jmap)")
+	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap dump (jmap); opt-in — the hprof carries secrets and PII unredacted")
+	cmd.Flags().BoolVar(&vthreads, "vthreads", false, "Capture a virtual-thread dump as JSON (JDK 21+; not in the default set)")
+	cmd.Flags().DurationVar(&jfr, "jfr", 0, "Capture a JFR recording of this duration, e.g. 60s (JDK 11+; not in the default set)")
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")

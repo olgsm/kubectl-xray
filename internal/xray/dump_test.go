@@ -53,14 +53,25 @@ func TestCaptureScriptFencing(t *testing.T) {
 func TestBuildJVMDumpScript(t *testing.T) {
 	const name = "mypod"
 	tests := []struct {
-		label                   string
-		thread, histogram, heap bool
-		wantContains            []string
-		wantAbsent              []string
+		label                             string
+		thread, histogram, heap, vthreads bool
+		jfr                               time.Duration
+		wantContains                      []string
+		wantAbsent                        []string
 	}{
 		{
-			label: "all steps", thread: true, histogram: true, heap: true,
-			wantContains: []string{"jstack 1", "GC.class_histogram", "jmap -dump:live", "mypod.jstack", "mypod.hprof", "/proc/1/root/tmp/mypod.hprof"},
+			label: "jfr only", jfr: 60 * time.Second,
+			wantContains: []string{"JFR.start", "duration=60s", "sleep 60", "/proc/1/root/tmp/mypod.jfr"},
+			wantAbsent:   []string{"jstack", "jmap", "GC.class_histogram"},
+		},
+		{
+			label: "all steps", thread: true, histogram: true, heap: true, vthreads: true,
+			wantContains: []string{"jstack 1", "GC.class_histogram", "jmap -dump:live", "mypod.jstack", "mypod.hprof", "/proc/1/root/tmp/mypod.hprof", "Thread.dump_to_file -format=json", "mypod.threads.json"},
+		},
+		{
+			label: "vthreads only", vthreads: true,
+			wantContains: []string{"Thread.dump_to_file", "/proc/1/root/tmp/mypod.threads.json"},
+			wantAbsent:   []string{"jstack", "jmap", "GC.class_histogram"},
 		},
 		{
 			label: "thread only", thread: true,
@@ -80,7 +91,7 @@ func TestBuildJVMDumpScript(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.label, func(t *testing.T) {
-			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, name)
+			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, tt.vthreads, tt.jfr, name)
 			if !strings.HasPrefix(got, `W="$(mktemp -d)"; `) {
 				t.Errorf("script must set up a work dir first; got %q", got)
 			}
