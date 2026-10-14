@@ -2,6 +2,7 @@ package xray
 
 import (
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -76,6 +77,7 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 		Short:         "Inspect pod environments and capture execution dumps",
 		SilenceUsage:  true, // don't dump usage on a runtime error
 		SilenceErrors: true, // we print the error ourselves in main
+		Version:       version(),
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	configFlags.AddFlags(root.PersistentFlags())
@@ -87,6 +89,16 @@ func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {
 	root.AddCommand(newDebugCmd(configFlags, streams))
 
 	return root
+}
+
+// version reports the module version Go stamps from VCS at build time: the tag
+// when HEAD is tagged, otherwise a pseudo-version with the commit (+dirty if
+// the tree had local changes).
+func version() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return "unknown"
 }
 
 func newGoDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
