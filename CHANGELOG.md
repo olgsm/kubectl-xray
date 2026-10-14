@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/olgsm/kubectl-xray/compare/v0.1.0...v0.1.1) (2026-10-14)
+
+
+### Miscellaneous Chores
+
+* release 0.1.1 ([3d148bc](https://github.com/olgsm/kubectl-xray/commit/3d148bc5e836ca4d28751da4817833130b6725f9))
+
 ## 0.1.0 (2026-10-14)
 
 
