@@ -1,4 +1,4 @@
-module kubectl-xray
+module github.com/olgsm/kubectl-xray
 
 go 1.26.0
 

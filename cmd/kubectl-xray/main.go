@@ -9,7 +9,7 @@ import (
 
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 
-	"kubectl-xray/internal/xray"
+	"github.com/olgsm/kubectl-xray/internal/xray"
 )
 
 func main() {

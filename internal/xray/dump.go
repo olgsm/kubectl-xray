@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"kubectl-xray/internal/archive"
-	"kubectl-xray/internal/redact"
+	"github.com/olgsm/kubectl-xray/internal/archive"
+	"github.com/olgsm/kubectl-xray/internal/redact"
 )
 
 // exitWait bounds how long we wait for the toolbox to report its exit code once

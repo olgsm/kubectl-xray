@@ -10,7 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"kubectl-xray/internal/redact"
+	"github.com/olgsm/kubectl-xray/internal/redact"
 )
 
 const defaultContainerAnnotation = "kubectl.kubernetes.io/default-container"

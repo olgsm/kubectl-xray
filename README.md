@@ -47,7 +47,10 @@ $ kubectl xray jvm-dump --heap mypod -o ./dumps    # heap dump into a local .tar
 ## Usage
 
 ```sh
-# build & install on PATH (kubectl discovers kubectl-* binaries as subcommands)
+# install the latest release into $(go env GOPATH)/bin (must be on PATH)
+go install github.com/olgsm/kubectl-xray/cmd/kubectl-xray@latest
+
+# or build & install from a checkout (kubectl discovers kubectl-* binaries as subcommands)
 make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 
 # capture JVM heap dump into a local bundle (redacted: primitive arrays zeroed)
