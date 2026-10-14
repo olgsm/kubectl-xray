@@ -212,7 +212,7 @@ Sampling the same pod over time is what turns this into leak evidence.`,
 
 func newJVMDumpCmd(configFlags *genericclioptions.ConfigFlags, streams genericiooptions.IOStreams) *cobra.Command {
 	o := &Options{configFlags: configFlags, IOStreams: streams}
-	var thread, histogram, heap, vthreads, extract bool
+	var thread, histogram, heap, vthreads, extract, noRedact bool
 	var output, maxSize, dumpDir string
 	var jfr time.Duration
 
@@ -229,18 +229,22 @@ multi-GB heap.
 With no step flags the thread dump and GC histogram are captured; naming any
 step captures only those.
 
---heap, --vthreads and --jfr are opt-in. A heap dump is excluded from the
-default set on purpose: an hprof contains whatever the process holds in
-memory — credentials, tokens, customer data — and cannot be redacted the way
-'xray env' masks its output. Ask for it deliberately, and handle the bundle
-accordingly. Virtual thread dumps need JDK 21+, and a JFR recording holds the
-capture open for its whole duration.`,
+--heap, --vthreads and --jfr are opt-in. Virtual thread dumps need JDK 21+, and
+a JFR recording holds the capture open for its whole duration.
+
+Heap dumps and JFR recordings are redacted by default. The hprof is scrubbed
+locally as it streams in: every primitive array is zeroed (String, byte[] and
+char[] contents), keeping the object graph and sizes for leak analysis. JFR is
+scrubbed in the toolbox with 'jfr scrub', dropping app-defined events and those
+recording env vars, system properties, the command line and exception
+messages. --no-redact keeps both raw; with --dump-dir nothing is redacted.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			resolveSteps(c.Flags(), []string{"thread", "histogram", "heap", "vthreads", "jfr"}, &thread, &histogram)
 			if !thread && !histogram && !heap && !vthreads && jfr == 0 {
 				return fmt.Errorf("nothing to dump: enable at least one of --thread, --histogram, --heap, --vthreads, --jfr")
 			}
+			o.redact = !noRedact
 			if err := o.Complete(c, args); err != nil {
 				return err
 			}
@@ -260,13 +264,14 @@ capture open for its whole duration.`,
 	o.addCaptureFlags(cmd, defaultJVMImage)
 	cmd.Flags().BoolVar(&thread, "thread", false, "Capture a thread dump (jstack)")
 	cmd.Flags().BoolVar(&histogram, "histogram", false, "Capture a GC class histogram (jcmd)")
-	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap dump (jmap); opt-in — the hprof carries secrets and PII unredacted")
+	cmd.Flags().BoolVar(&heap, "heap", false, "Capture a heap dump (jmap); primitive array contents are zeroed unless --no-redact")
 	cmd.Flags().BoolVar(&vthreads, "vthreads", false, "Capture a virtual-thread dump as JSON (JDK 21+; not in the default set)")
 	cmd.Flags().DurationVar(&jfr, "jfr", 0, "Capture a JFR recording of this duration, e.g. 60s (JDK 11+; not in the default set)")
 	cmd.Flags().BoolVar(&extract, "extract", false, "Unpack dump bundle into output directory instead of writing a single .tar.gz")
 	cmd.Flags().StringVarP(&output, "output", "o", "dumps", "Local directory to write the dump bundle into")
 	cmd.Flags().StringVar(&maxSize, "max-size", "", "Fail if the dump exceeds this size (e.g. 2Gi); empty means unlimited")
 	cmd.Flags().StringVar(&dumpDir, "dump-dir", "", "Leave artifacts in this directory inside the target instead of streaming a bundle back")
+	cmd.Flags().BoolVar(&noRedact, "no-redact", false, "Keep heap dump and JFR contents raw (they carry secrets and PII)")
 	return cmd
 }
 

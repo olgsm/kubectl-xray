@@ -50,8 +50,8 @@ $ kubectl xray jvm-dump --heap mypod -o ./dumps    # heap dump into a local .tar
 # build & install on PATH (kubectl discovers kubectl-* binaries as subcommands)
 make install   # → /usr/local/bin; override with INSTALL_DIR=~/bin
 
-# capture JVM heap dump into a local bundle OR into a volume mounted in the pod
-# (must be writable by the app's UID); note: a heap dump carries secrets and PII!
+# capture JVM heap dump into a local bundle (redacted: primitive arrays zeroed)
+# OR into a volume mounted in the pod (must be writable by the app's UID; not redacted!)
 kubectl xray jvm-dump <pod> -n <namespace> [-c <container>] --heap -o ./dumps
 kubectl xray jvm-dump <pod> -n <namespace> [-c <container>] --heap --dump-dir /dumps
 
@@ -103,7 +103,10 @@ JDK (`--image eclipse-temurin:17-jdk`).
    Secret-looking values are masked heuristically by default so they never hit your terminal or logs (`--no-redact` to opt out).
 2. **Capture dumps** ✅ — JVM (jstack, GC histogram, jmap heap, JDK 21 virtual
    threads, JFR) and Go (goroutine, heap, CPU pprof), streamed into one verified
-   bundle under an admission-safe profile.
+   bundle under an admission-safe profile. Heap dumps and JFR are redacted by
+   default: hprof primitive arrays (string/byte[] contents) are zeroed, keeping
+   the object graph; JFR drops env, sysprops, command line and exception events
+   (`--no-redact` to opt out).
 3. **Runtime facts** ✅ — `info` reports the target's command line, threads,
    RSS/PSS, cgroup limits and fd usage from `/proc`, and optionally scrapes the
    app's metrics endpoint over the pod's network namespace.

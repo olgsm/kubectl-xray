@@ -91,7 +91,7 @@ func TestBuildJVMDumpScript(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.label, func(t *testing.T) {
-			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, tt.vthreads, tt.jfr, name, "")
+			got := buildJVMDumpScript(tt.thread, tt.histogram, tt.heap, tt.vthreads, tt.jfr, name, "", false)
 			if !strings.HasPrefix(got, `W="$(mktemp -d)"; `) {
 				t.Errorf("script must set up a work dir first; got %q", got)
 			}
@@ -116,7 +116,7 @@ func TestBuildJVMDumpScript(t *testing.T) {
 // straight to that path (no staging copy, no rm), the toolbox reaches the same
 // directory through /proc/1/root, and nothing is tarred to stdout.
 func TestBuildJVMDumpScriptDumpDir(t *testing.T) {
-	got := buildJVMDumpScript(true, false, true, true, 30*time.Second, "mypod", "/dumps")
+	got := buildJVMDumpScript(true, false, true, true, 30*time.Second, "mypod", "/dumps", false)
 
 	for _, want := range []string{
 		`W=/proc/1/root/dumps`,
@@ -143,5 +143,16 @@ func TestBuildGoDumpScriptDumpDir(t *testing.T) {
 	}
 	if strings.Contains(got, "tar czf") {
 		t.Errorf("did not want a tar with --dump-dir; got %q", got)
+	}
+}
+
+func TestBuildJVMDumpScriptScrubsJFR(t *testing.T) {
+	got := buildJVMDumpScript(false, false, false, false, 30*time.Second, "mypod", "", true)
+	if !strings.Contains(got, `jfr scrub --include-events 'jdk.*' --exclude-events jdk.InitialEnvironmentVariable,`) ||
+		!strings.Contains(got, `/proc/1/root/tmp/mypod.jfr "$W/mypod.jfr" >/dev/null`) {
+		t.Errorf("want the JFR scrubbed into the work dir; got %q", got)
+	}
+	if strings.Contains(got, "cp /proc/1/root/tmp/mypod.jfr") {
+		t.Errorf("did not want the raw JFR copied; got %q", got)
 	}
 }

@@ -3,6 +3,7 @@ package xray
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"kubectl-xray/internal/archive"
+	"kubectl-xray/internal/redact"
 )
 
 // exitWait bounds how long we wait for the toolbox to report its exit code once
@@ -49,16 +51,39 @@ func (s dirStore) Put(r io.Reader) (int, error) {
 	return len(files), err
 }
 
+// redactStore scrubs heap dumps in the stream (see redact.Bundle) before inner
+// persists it, so no unredacted hprof is ever written locally.
+type redactStore struct{ inner Store }
+
+func (s redactStore) Put(r io.Reader) (int, error) {
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := redact.Bundle(r, pw)
+		_ = pw.CloseWithError(err)
+		done <- err
+	}()
+	n, err := s.inner.Put(pr)
+	_ = pr.Close() // unblock Bundle if inner stopped early
+	if rerr := <-done; rerr != nil && !errors.Is(rerr, io.ErrClosedPipe) {
+		return n, fmt.Errorf("redacting dump: %w (--no-redact keeps it raw)", rerr)
+	}
+	return n, err
+}
+
 // jvmDump injects a JDK toolbox sharing the target's PID namespace, runs the
 // enabled dump steps against PID 1, and streams a tar of the artifacts into a
 // local timestamped directory — or, with dumpDir, leaves them in a directory
 // mounted inside the target.
 func (o *Options) jvmDump(ctx context.Context, thread, histogram, heap, vthreads bool, jfr time.Duration, extract bool, outDir, dumpDir string, maxSize int64) error {
-	if heap {
-		o.logf("warning: the heap dump holds whatever the process has in memory — credentials, tokens, customer data — and is not redacted")
+	if dumpDir != "" {
+		o.redact = false
+	}
+	if (heap || jfr > 0) && !o.redact {
+		o.logf("warning: heap dumps and JFR recordings are not redacted with --no-redact or --dump-dir — they can carry credentials, tokens, customer data")
 	}
 	script := func(name string) string {
-		return buildJVMDumpScript(thread, histogram, heap, vthreads, jfr, name, dumpDir)
+		return buildJVMDumpScript(thread, histogram, heap, vthreads, jfr, name, dumpDir, o.redact)
 	}
 	if dumpDir != "" {
 		return o.captureInPod(ctx, "jvm-dump", script, dumpDir)
@@ -182,6 +207,9 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 		report = filepath.Join(outDir, base+".tar.gz")
 		store = archiveStore{path: report, maxSize: maxSize}
 	}
+	if o.redact {
+		store = redactStore{store}
+	}
 	artifacts, consumeErr := store.Put(stdoutR)
 
 	// We've consumed the full archive; release the trailing read so the container
@@ -254,10 +282,15 @@ func buildGoDumpScript(port string, goroutine, heap, profile bool, name, dumpDir
 	return b.String()
 }
 
+// jfrScrubFilters keep only JDK events (app-defined ones can carry anything) and
+// drop those recording env vars, system/security properties, the command line,
+// other processes' command lines and exception messages.
+const jfrScrubFilters = `--include-events 'jdk.*' --exclude-events jdk.InitialEnvironmentVariable,jdk.InitialSystemProperty,jdk.InitialSecurityProperty,jdk.SecurityPropertyModification,jdk.JVMInformation,jdk.SystemProcess,jdk.ProcessStart,jdk.JavaExceptionThrow,jdk.JavaErrorThrow`
+
 // buildJVMDumpScript writes each enabled artifact into a work dir, then writes a
 // gzipped tar of it to stdout. Only tar writes to stdout; tool chatter is
 // redirected away.
-func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duration, name, dumpDir string) string {
+func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duration, name, dumpDir string, scrub bool) string {
 	var b strings.Builder
 	b.WriteString(workDirFor(dumpDir))
 	// jvmPath is how the target JVM addresses the destination; jvmSeen is how the
@@ -298,7 +331,11 @@ func buildJVMDumpScript(thread, histogram, heap, vthreads bool, jfr time.Duratio
 		secs := int(jfr.Seconds())
 		_, _ = fmt.Fprintf(&b, `jcmd 1 JFR.start name=xray settings=profile duration=%ds filename=%s/%s.jfr >/dev/null; sleep %d; `, secs, jvmPath, name, secs)
 		_, _ = fmt.Fprintf(&b, `i=0; while [ ! -f %s/%s.jfr ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; `, jvmSeen, name)
-		if dumpDir == "" {
+		switch {
+		case dumpDir != "":
+		case scrub:
+			_, _ = fmt.Fprintf(&b, `jfr scrub %s /proc/1/root/tmp/%s.jfr "$W/%s.jfr" >/dev/null; rm -f /proc/1/root/tmp/%s.jfr; `, jfrScrubFilters, name, name, name)
+		default:
 			_, _ = fmt.Fprintf(&b, `cp /proc/1/root/tmp/%s.jfr "$W/"; rm -f /proc/1/root/tmp/%s.jfr; `, name, name)
 		}
 	}
