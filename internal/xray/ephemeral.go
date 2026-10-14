@@ -124,11 +124,14 @@ func buildEphemeralContainer(targetContainer, image string, command []string, st
 
 	ec := corev1.EphemeralContainer{
 		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
-			Name:    "xray-debug-" + suffix,
-			Image:   image,
-			Stdin:   stdin,
-			TTY:     tty,
-			Command: command,
+			Name:  "xray-debug-" + suffix,
+			Image: image,
+			Stdin: stdin,
+			// Without it, closing the attach stream never reaches the container as EOF,
+			// so a trailing `read` blocks and the toolbox never exits.
+			StdinOnce: stdin,
+			TTY:       tty,
+			Command:   command,
 			SecurityContext: &corev1.SecurityContext{
 				RunAsNonRoot:             new(true),
 				AllowPrivilegeEscalation: new(false),
