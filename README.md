@@ -13,6 +13,7 @@ or dumps straight to your terminal or a local file.
 ```console
 $ kubectl xray env deploy/checkout -n shop | grep DB_
 xray: found 3 pods for deployment checkout, using pod/checkout-7d9f8c-x2k4q
+xray: injecting env toolbox xray-debug-8b21e0 (image busybox:1.36, UID 1000) in shop/checkout-7d9f8c-x2k4q...
 DB_HOST=postgres.shop.svc
 DB_PASSWORD=***REDACTED***
 DB_URL=***REDACTED***
@@ -46,7 +47,8 @@ xray: wrote dumps/checkout-7d9f8c-x2k4q-2026-10-22_14-03-11.tar.gz (2 artifacts,
   `byte[]`, `char[]` contents) while keeping the object graph and sizes for leak
   analysis, so a raw hprof never touches your disk. JFR recordings are stripped of env
   vars, system properties, the command line and exception messages. `--no-redact`
-  opts out.
+  opts out. Either way nothing captured lands in container logs on the node, where
+  `kubectl logs` and log collectors would pick it up.
 - **Runtime facts and a shell.** `info` shows the command line, threads, RSS/PSS,
   cgroup limits and fd usage, plus app metrics with `--metrics-port`; `debug` opens an
   interactive shell beside the app.
@@ -153,7 +155,7 @@ kubectl xray debug deploy/api
 
 | Flag             |                                                                             |
 |------------------|-----------------------------------------------------------------------------|
-| `--image`        | toolbox image; `busybox:1.36`, or `eclipse-temurin:21-jdk` for `jvm-dump`   |
+| `--image`        | toolbox image; `busybox:1.36`, or `eclipse-temurin:21-jdk` for `jvm-dump`. A custom one needs `sh`, `sleep` and a writable `/tmp` |
 | `--run-as-user`  | toolbox UID, instead of the inferred one                                    |
 | `-o`, `--output` | directory for dump bundles (default `dumps`)                                |
 | `--extract`      | unpack the bundle into a directory instead of a `.tar.gz`                   |
