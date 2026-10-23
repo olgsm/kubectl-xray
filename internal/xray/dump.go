@@ -11,13 +11,11 @@ import (
 	"strings"
 	"time"
 
+	utilexec "k8s.io/client-go/util/exec"
+
 	"github.com/olgsm/kubectl-xray/internal/archive"
 	"github.com/olgsm/kubectl-xray/internal/redact"
 )
-
-// exitWait bounds how long we wait for the toolbox to report its exit code once
-// we've closed its stdin; it only has the trailing read left to do.
-const exitWait = 60 * time.Second
 
 // Store persists a captured dump stream. Named for persistence so a future
 // backend (e.g. an S3 uploader) can satisfy it alongside the local strategies.
@@ -101,7 +99,7 @@ func (o *Options) captureInPod(ctx context.Context, label string, innerScript fu
 	}
 	o.logf("%s: writing artifacts into %s inside %s/%s; nothing is streamed out", label, dumpDir, o.namespace, pod.Name)
 	name := fmt.Sprintf("%s-%s", pod.Name, time.Now().Format("2006-01-02_15-04-05"))
-	return o.captureOn(ctx, pod, []string{"sh", "-c", "set -e; " + innerScript(name)})
+	return o.captureOn(ctx, pod, label, []string{"sh", "-c", "set -e; " + innerScript(name)})
 }
 
 func countTrue(flags ...bool) int {
@@ -127,50 +125,28 @@ func (o *Options) goDump(ctx context.Context, port string, goroutine, heap, prof
 }
 
 // keepalive emits a NUL on stderr every 20s. A dump tool can work silently for
-// minutes (jmap on a large heap), and an attach stream with no traffic gets
+// minutes (jmap on a large heap), and an exec stream with no traffic gets
 // dropped by middleboxes between us and the apiserver — which used to kill the
 // capture mid-flight. The NULs are stripped before stderr is reported.
-const keepalive = `(while :; do sleep 20; printf '\000' >&2; done) & HB=$!; trap 'kill $HB 2>/dev/null || true' EXIT; `
+// It must leave no process behind: an orphan is reparented to the target's PID 1,
+// which typically never reaps it and keeps it as a zombie. Hence one-second
+// foreground sleeps, which the TERM trap waits out, rather than a background one.
+const keepalive = `(trap exit TERM; while :; do i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done; printf '\000' >&2; done) & HB=$!; trap 'kill $HB 2>/dev/null; wait $HB 2>/dev/null || true' EXIT; `
 
-// captureBundle injects a toolbox container running innerScript (which must
-// write a gzipped tar of its artifacts to stdout), streams that tar out, and
-// writes it to a local .tar.gz (or unpacks it with --extract). The script is
-// fenced by reads so its output can't start before we attach or end before we
-// drain it. want is the number of artifacts the enabled flags should produce;
-// the capture fails unless the toolbox exits 0 and delivers exactly that many.
+// captureBundle runs innerScript (which must write a gzipped tar of its
+// artifacts to stdout) in a toolbox beside the target, and writes the tar to a
+// local .tar.gz (or unpacks it with --extract). want is the number of artifacts
+// the enabled flags should produce; the capture fails unless the script exits 0
+// and delivers exactly that many.
 func (o *Options) captureBundle(ctx context.Context, label string, innerScript func(name string) string, want int, outDir string, extract bool, maxSize int64) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err
 	}
-	container := o.resolveContainer(pod)
-
-	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
-	if err != nil {
-		return err
-	}
 	name := pod.Name
-
-	// Leading read: wait for our go-signal so output can't start before we attach.
-	// Trailing read: stay alive until we close stdin, so the container doesn't exit
-	// and tear down stdout before we've drained it. set -e so a failing dump step
-	// aborts with a non-zero exit instead of tarring up whatever it managed to write.
-	script := "set -e; read _; " + keepalive + innerScript(name) + "; read _ || true"
-	ec, err := buildEphemeralContainer(container, o.image, []string{"sh", "-c", script}, true, false, uid, gid)
+	pod, ecName, err := o.startToolbox(ctx, pod, label)
 	if err != nil {
 		return err
-	}
-	o.logf("injecting %s toolbox %s (image %s, UID %d) in %s/%s...", label, ec.Name, o.image, *uid, o.namespace, name)
-	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
-	if err != nil {
-		return err
-	}
-	term, err := waitForEphemeralStart(ctx, o.clientset, o.namespace, pod.Name, ec.Name)
-	if err != nil {
-		return err
-	}
-	if term != nil {
-		return fmt.Errorf("toolbox %s exited before attach: %d (%s)", ec.Name, term.ExitCode, term.Reason)
 	}
 
 	base := fmt.Sprintf("%s-%s", name, time.Now().Format("2006-01-02_15-04-05"))
@@ -179,23 +155,19 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 	}
 	o.logf("capturing dumps...")
 
+	// set -e so a failing dump step aborts with a non-zero exit instead of
+	// tarring up whatever it managed to write.
+	command := []string{"sh", "-c", "set -e; " + keepalive + innerScript(name)}
 	stdoutR, stdoutW := io.Pipe()
-	stdinR, stdinW := io.Pipe()
-
-	// Attach in the background; it streams the container's stdout (the gzipped tar) into stdoutW
-	// until the container exits, or we tear the stream down.
 	var stderr bytes.Buffer
-	attachCtx, cancelAttach := context.WithCancel(ctx)
-	defer cancelAttach()
-	attachDone := make(chan error, 1)
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
+	execDone := make(chan error, 1)
 	go func() {
-		err := attachToContainer(attachCtx, o.restConfig, o.clientset, o.namespace, pod.Name, ec.Name, stdinR, stdoutW, &stderr, false, nil)
+		err := execInContainer(execCtx, o.restConfig, o.clientset, o.namespace, pod.Name, ecName, inToolbox(command...), nil, stdoutW, &stderr, false, nil)
 		_ = stdoutW.CloseWithError(err)
-		attachDone <- err
+		execDone <- err
 	}()
-
-	// Send the signal, but keep stdin open: an immediate EOF drops the attach before the output arrives.
-	go func() { _, _ = stdinW.Write([]byte("\n")) }()
 
 	// Default: write one portable .tar.gz. --extract: unpack into a directory.
 	var store Store
@@ -211,30 +183,21 @@ func (o *Options) captureBundle(ctx context.Context, label string, innerScript f
 		store = redactStore{store}
 	}
 	artifacts, consumeErr := store.Put(stdoutR)
-
-	// We've consumed the full archive; release the trailing read so the container
-	// exits, then drain to EOF so the attach's stdout copy finishes cleanly.
-	_ = stdinW.Close()
+	if consumeErr != nil {
+		cancelExec()
+	}
 	_, _ = io.Copy(io.Discard, stdoutR)
-
-	attachErr := <-attachDone
-
-	// The toolbox's exit code travels over the API, not the stream that carried the
-	// payload, so it still answers "was this dump complete?" after the stream breaks.
-	exitCtx, cancelExit := context.WithTimeout(ctx, exitWait)
-	defer cancelExit()
-	term, exitErr := waitForEphemeralExit(exitCtx, o.clientset, o.namespace, pod.Name, ec.Name)
+	execErr := <-execDone
 
 	msg := strings.TrimSpace(strings.ReplaceAll(stderr.String(), "\x00", ""))
+	var exitErr utilexec.ExitError
 	switch {
-	case exitErr != nil:
-		return fmt.Errorf("could not confirm %s completed (%v) — treat %s as incomplete (stderr: %s)", ec.Name, exitErr, report, msg)
-	case term.ExitCode != 0:
-		return fmt.Errorf("%s exited %d — dump is incomplete, discard %s (stderr: %s)", ec.Name, term.ExitCode, report, msg)
+	case errors.As(execErr, &exitErr):
+		return fmt.Errorf("%s exited %d — dump is incomplete, discard %s (stderr: %s)", ecName, exitErr.ExitStatus(), report, msg)
 	case consumeErr != nil:
 		return fmt.Errorf("capturing dumps: %w (stderr: %s)", consumeErr, msg)
-	case attachErr != nil:
-		return fmt.Errorf("dump stream broke before it was fully read: %w (stderr: %s)", attachErr, msg)
+	case execErr != nil:
+		return fmt.Errorf("dump stream broke before it was fully read — treat %s as incomplete: %w (stderr: %s)", report, execErr, msg)
 	case artifacts != want:
 		return fmt.Errorf("expected %d dump artifacts, got %d — discard %s (stderr: %s)", want, artifacts, report, msg)
 	}

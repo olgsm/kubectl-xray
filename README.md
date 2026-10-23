@@ -93,7 +93,7 @@ checkout, `make install` copies the binary to `/usr/local/bin` (override with
 `INSTALL_DIR=~/bin`).
 
 **Requirements:** Kubernetes 1.25+ (ephemeral containers) and permission to update
-`pods/ephemeralcontainers` and attach to pods in the target namespace.
+`pods/ephemeralcontainers` and exec into pods in the target namespace.
 
 <details>
 <summary>Minimal Role</summary>
@@ -111,11 +111,11 @@ rules:
     resources: [ pods/ephemeralcontainers ]
     verbs: [ update ]
   - apiGroups: [ "" ]
-    resources: [ pods/attach ]
+    resources: [ pods/exec ]
     verbs: [ create ]
   - apiGroups: [ "" ]
     resources: [ pods/log ]
-    verbs: [ get ]
+    verbs: [ get ] # only for the UID probe, when the pod spec sets no runAsUser
   - apiGroups: [ apps ]
     resources: [ deployments ] # only for deploy/NAME targets
     verbs: [ get ]
@@ -180,9 +180,15 @@ the pod spec, `--run-as-user`, or a quick probe of `/proc/1/status` when neither
 it. The toolbox runs non-root with all capabilities dropped, no privilege escalation
 and the `RuntimeDefault` seccomp profile.
 
+The toolbox's own process only idles; the work runs in it over `kubectl exec`. The
+kubelet writes a container's own output to its log, where `kubectl logs` and log
+collectors can read it, but exec output never lands there, so no captured env, shell
+session or dump is left on the node. The toolbox exits as soon as the command
+finishes, or within a minute if xray dies before starting one.
+
 `env` and `info` write to stdout while progress goes to stderr, so output stays
 pipeable. Dump commands tar and gzip their artifacts in the toolbox and stream them
-out over the attach connection; the capture fails if the toolbox exits non-zero or an
+out over the exec connection; the capture fails if the command exits non-zero or an
 artifact is missing, so a partial bundle never passes as complete.
 
 Ephemeral containers can't be removed from a pod: each run leaves a terminated

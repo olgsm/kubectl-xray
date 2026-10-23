@@ -3,6 +3,7 @@ package xray
 import (
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,10 +31,8 @@ func (o *Options) addCaptureFlags(cmd *cobra.Command, defaultImage string) {
 // would have to default to true, leaving --heap a no-op and --heap=false the
 // only way to say anything.
 func resolveSteps(fs *pflag.FlagSet, names []string, byDefault ...*bool) {
-	for _, n := range names {
-		if fs.Changed(n) {
-			return
-		}
+	if slices.ContainsFunc(names, fs.Changed) {
+		return
 	}
 	for _, p := range byDefault {
 		*p = true
@@ -66,7 +65,7 @@ func (o *Options) runCapture(c *cobra.Command, args, command []string) error {
 	if err := o.Validate(); err != nil {
 		return err
 	}
-	return o.capture(c.Context(), command)
+	return o.capture(c.Context(), c.Name(), command)
 }
 
 func NewCmdXRay(streams genericiooptions.IOStreams) *cobra.Command {

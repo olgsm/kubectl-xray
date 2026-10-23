@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +21,32 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/streaming/pkg/httpstream"
 )
+
+// startedFile and doneFile are touched when an exec'd command starts and
+// finishes, driving the toolbox's idle loop (idleCommand).
+const (
+	startedFile = "/tmp/xray-started"
+	doneFile    = "/tmp/xray-done"
+)
+
+// startTimeout bounds an idle toolbox whose command never started, e.g. when
+// xray died between injecting it and the exec.
+const startTimeout = time.Minute
+
+// idleCommand is the toolbox's main process. It prints nothing: the kubelet
+// logs a container's own stdout/stderr, readable with kubectl logs and shipped
+// by log collectors, so the actual work is exec'd in (exec output isn't logged).
+// It exits once the command is done, or after timeout if none ever started.
+func idleCommand(timeout time.Duration) []string {
+	return []string{"sh", "-c", fmt.Sprintf(`i=0; while [ ! -e %s ]; do [ -e %s ] || i=$((i+1)); [ $i -le %d ] || exit 1; sleep 1; done`, doneFile, startedFile, int(timeout.Seconds()))}
+}
+
+// inToolbox wraps command so the toolbox exits once it finishes, however it
+// finishes. The trailing exit keeps "$@" from being the last command, which
+// some shells would exec in place and so skip the EXIT trap.
+func inToolbox(command ...string) []string {
+	return append([]string{"sh", "-c", `touch ` + startedFile + `; trap 'touch ` + doneFile + `' EXIT; trap 'exit 129' HUP INT TERM; "$@"; exit $?`, "xray"}, command...)
+}
 
 // probeUID runs the discovery container as an arbitrary nonroot user; it only
 // reads world-readable /proc/1/status, so its own UID is irrelevant.
@@ -73,7 +100,7 @@ func randSuffix() (string, error) {
 // It returns the updated pod (the probe is appended to its ephemeral list).
 func discoverTargetUID(ctx context.Context, client kubernetes.Interface, namespace string, pod *corev1.Pod, targetContainer, image string) (*int64, *corev1.Pod, error) {
 	pu := probeUID
-	ec, err := buildEphemeralContainer(targetContainer, image, []string{"cat", "/proc/1/status"}, false, false, &pu, nil)
+	ec, err := buildEphemeralContainer(targetContainer, image, []string{"cat", "/proc/1/status"}, &pu, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -116,7 +143,7 @@ func parseStatusUID(status string) (int64, error) {
 
 // buildEphemeralContainer assembles the debug container spec under the restricted
 // profile, running as the already-resolved uid/gid.
-func buildEphemeralContainer(targetContainer, image string, command []string, stdin, tty bool, uid, gid *int64) (corev1.EphemeralContainer, error) {
+func buildEphemeralContainer(targetContainer, image string, command []string, uid, gid *int64) (corev1.EphemeralContainer, error) {
 	suffix, err := randSuffix()
 	if err != nil {
 		return corev1.EphemeralContainer{}, fmt.Errorf("generating container name: %w", err)
@@ -124,14 +151,9 @@ func buildEphemeralContainer(targetContainer, image string, command []string, st
 
 	ec := corev1.EphemeralContainer{
 		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
-			Name:  "xray-debug-" + suffix,
-			Image: image,
-			Stdin: stdin,
-			// Without it, closing the attach stream never reaches the container as EOF,
-			// so a trailing `read` blocks and the toolbox never exits.
-			StdinOnce: stdin,
-			TTY:       tty,
-			Command:   command,
+			Name:    "xray-debug-" + suffix,
+			Image:   image,
+			Command: command,
 			SecurityContext: &corev1.SecurityContext{
 				RunAsNonRoot:             new(true),
 				AllowPrivilegeEscalation: new(false),
@@ -205,21 +227,6 @@ func waitForEphemeralStart(ctx context.Context, client kubernetes.Interface, nam
 	return term, err
 }
 
-// waitForEphemeralExit blocks until the named ephemeral container has finished,
-// so a capture can be judged by the toolbox's exit code over a channel that
-// survives the stream it wrote its payload to.
-func waitForEphemeralExit(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string) (*corev1.ContainerStateTerminated, error) {
-	var term *corev1.ContainerStateTerminated
-	err := watchEphemeralStatus(ctx, client, namespace, podName, ecName, func(st corev1.ContainerStatus) (bool, error) {
-		if st.State.Terminated == nil {
-			return false, nil
-		}
-		term = st.State.Terminated
-		return true, nil
-	})
-	return term, err
-}
-
 // watchEphemeralStatus watches the pod and feeds the named ephemeral container's
 // status to check until it reports done (or errors).
 func watchEphemeralStatus(ctx context.Context, client kubernetes.Interface, namespace, podName, ecName string, check func(corev1.ContainerStatus) (bool, error)) error {
@@ -258,18 +265,18 @@ func watchEphemeralStatus(ctx context.Context, client kubernetes.Interface, name
 	}
 }
 
-// attachToContainer attaches to a running container's stdio over a binary-safe stream.
-// Feeding stdin lets the container's command block on `read _; ...` until we're connected;
-// a trick is needed to guarantee that we don't miss its stdout (i.e., to avoid the race upon attach).
-func attachToContainer(ctx context.Context, restConfig *rest.Config, client kubernetes.Interface, namespace, podName, containerName string, stdin io.Reader, stdout, stderr io.Writer, tty bool, sizeQueue remotecommand.TerminalSizeQueue) error {
+// execInContainer runs command in a running container over a binary-safe
+// stream. A non-zero exit comes back as a k8s.io/client-go/util/exec.ExitError.
+func execInContainer(ctx context.Context, restConfig *rest.Config, client kubernetes.Interface, namespace, podName, containerName string, command []string, stdin io.Reader, stdout, stderr io.Writer, tty bool, sizeQueue remotecommand.TerminalSizeQueue) error {
 	req := client.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
 		Namespace(namespace).
 		Name(podName).
-		SubResource("attach").
-		VersionedParams(&corev1.PodAttachOptions{
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
 			Container: containerName,
+			Command:   command,
 			Stdin:     stdin != nil,
 			Stdout:    true,
 			Stderr:    !tty, // stderr goes into stdout

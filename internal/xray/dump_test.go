@@ -3,51 +3,67 @@ package xray
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestCaptureScriptFencing runs the wrapper captureBundle builds around an inner
-// script through a real shell: a failing step must abort before anything reaches
-// stdout, and the keepalive must stay off stdout and not outlive the script.
-func TestCaptureScriptFencing(t *testing.T) {
-	run := func(t *testing.T, inner string) (stdout, stderr string, err error) {
-		t.Helper()
-		script := "set -e; read _; " + keepalive + inner + "; read _ || true"
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "sh", "-c", script)
-		cmd.Stdin = strings.NewReader("\n")
-		var out, errb bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &out, &errb
-		err = cmd.Run()
-		if ctx.Err() != nil {
-			t.Fatalf("script did not exit — keepalive leaked: %v", ctx.Err())
+// TestToolboxLifecycle runs the toolbox's idle loop and an exec'd capture
+// through a real shell: a failing dump step aborts before any payload, the
+// payload and exit code pass through untouched, the keepalive doesn't outlive
+// the capture, and the idle toolbox exits once the capture is done, or soon
+// after start if no capture ever runs.
+func TestToolboxLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	command := func(args []string) *exec.Cmd {
+		for i := range args {
+			args[i] = strings.NewReplacer(doneFile, filepath.Join(dir, "done"), startedFile, filepath.Join(dir, "started")).Replace(args[i])
 		}
-		return out.String(), errb.String(), err
+		return exec.CommandContext(ctx, args[0], args[1:]...)
+	}
+	capture := func(t *testing.T, inner string) (stdout string, code int) {
+		t.Helper()
+		cmd := command(inToolbox("sh", "-c", "set -e; "+keepalive+inner))
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		if ctx.Err() != nil {
+			t.Fatalf("capture did not exit — keepalive leaked: %v", ctx.Err())
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return out.String(), exitErr.ExitCode()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out.String(), 0
 	}
 
-	t.Run("failing step aborts with no payload", func(t *testing.T) {
-		stdout, _, err := run(t, `false; printf payload`)
-		if err == nil {
-			t.Error("want non-zero exit when a dump step fails")
-		}
-		if stdout != "" {
-			t.Errorf("want no stdout after a failed step; got %q", stdout)
-		}
-	})
+	unused := command(idleCommand(time.Second))
+	if err := unused.Run(); err == nil || ctx.Err() != nil {
+		t.Errorf("idle toolbox with no capture: want a non-zero exit after the timeout, got %v (%v)", err, ctx.Err())
+	}
 
-	t.Run("payload passes through untouched", func(t *testing.T) {
-		stdout, stderr, err := run(t, `printf payload`)
-		if err != nil {
-			t.Fatalf("script failed: %v (stderr %q)", err, stderr)
-		}
-		if stdout != "payload" {
-			t.Errorf("stdout = %q, want %q — keepalive must not write to stdout", stdout, "payload")
-		}
-	})
+	idle := command(idleCommand(time.Second))
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Outlasts the timeout: a started capture must keep the toolbox alive.
+	if out, code := capture(t, `sleep 2; printf payload`); code != 0 || out != "payload" {
+		t.Errorf("exit %d, stdout %q; want 0 and the payload untouched", code, out)
+	}
+	if err := idle.Wait(); err != nil || ctx.Err() != nil {
+		t.Errorf("idle toolbox did not exit cleanly after the capture: %v (%v)", err, ctx.Err())
+	}
+	if out, code := capture(t, `false; printf payload`); code != 1 || out != "" {
+		t.Errorf("failing step: exit %d, stdout %q; want 1 and no payload", code, out)
+	}
 }
 
 func TestBuildJVMDumpScript(t *testing.T) {

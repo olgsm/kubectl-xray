@@ -2,13 +2,14 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilexec "k8s.io/client-go/util/exec"
 
 	"github.com/olgsm/kubectl-xray/internal/redact"
 )
@@ -141,62 +142,71 @@ func (o *Options) resolveUID(ctx context.Context, pod *corev1.Pod, container str
 	return uid, gid, pod, nil
 }
 
-// capture runs command in an ephemeral toolbox container alongside the target
-// and streams its stdout to o.Out via the container logs. Used by env.
-func (o *Options) capture(ctx context.Context, command []string) error {
+// startToolbox injects an idle toolbox (idleCommand) beside the target, matched
+// to its UID, and waits for it to run. Work is then exec'd into it via
+// inToolbox, so none of it lands in the container log.
+func (o *Options) startToolbox(ctx context.Context, pod *corev1.Pod, label string) (*corev1.Pod, string, error) {
+	container := o.resolveContainer(pod)
+	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
+	if err != nil {
+		return nil, "", err
+	}
+	ec, err := buildEphemeralContainer(container, o.image, idleCommand(startTimeout), uid, gid)
+	if err != nil {
+		return nil, "", err
+	}
+	o.logf("injecting %s toolbox %s (image %s, UID %d) in %s/%s...", label, ec.Name, o.image, *uid, o.namespace, pod.Name)
+	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
+	if err != nil {
+		return nil, "", err
+	}
+	term, err := waitForEphemeralStart(ctx, o.clientset, o.namespace, pod.Name, ec.Name)
+	if err != nil {
+		return nil, "", err
+	}
+	if term != nil {
+		return nil, "", fmt.Errorf("toolbox %s exited before it could run anything: %d (%s)", ec.Name, term.ExitCode, term.Reason)
+	}
+	return pod, ec.Name, nil
+}
+
+// capture runs command in a toolbox beside the target and writes its stdout to
+// o.Out. Used by env and info.
+func (o *Options) capture(ctx context.Context, label string, command []string) error {
 	pod, err := o.resolvePod(ctx)
 	if err != nil {
 		return err
 	}
-	return o.captureOn(ctx, pod, command)
+	return o.captureOn(ctx, pod, label, command)
 }
 
 // captureOn is capture against an already-resolved pod, so a caller that needs
 // the pod's identity first doesn't resolve it twice (and risk landing on a
 // different replica the second time).
-func (o *Options) captureOn(ctx context.Context, pod *corev1.Pod, command []string) error {
-	container := o.resolveContainer(pod)
-
-	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
+func (o *Options) captureOn(ctx context.Context, pod *corev1.Pod, label string, command []string) error {
+	pod, ecName, err := o.startToolbox(ctx, pod, label)
 	if err != nil {
 		return err
 	}
 
-	ec, err := buildEphemeralContainer(container, o.image, command, false, false, uid, gid)
-	if err != nil {
-		return err
-	}
-	pod, err = injectEphemeralContainer(ctx, o.clientset, o.namespace, pod.Name, ec)
-	if err != nil {
-		return err
-	}
-	term, err := waitForEphemeralStart(ctx, o.clientset, o.namespace, pod.Name, ec.Name)
-	if err != nil {
-		return err
-	}
-
-	// Stream logs whether it's still running or already finished — the output
-	// is the captured evidence, readable in both cases.
-	out := io.Writer(o.Out)
+	out := o.Out
 	var rw *redact.Writer
 	if o.redact {
 		rw = redact.NewWriter(o.Out)
 		out = rw
 	}
-	if err := streamEphemeralLogs(ctx, o.clientset, o.namespace, pod.Name, ec.Name, out); err != nil {
-		return err
-	}
+	err = execInContainer(ctx, o.restConfig, o.clientset, o.namespace, pod.Name, ecName, inToolbox(command...), nil, out, o.ErrOut, false, nil)
 	if rw != nil {
-		if err := rw.Flush(); err != nil {
-			return err
+		if ferr := rw.Flush(); ferr != nil {
+			return ferr
 		}
 		if rw.N > 0 {
 			o.logf("masked %d secret-looking value(s); use --no-redact to disable", rw.N)
 		}
 	}
-	if term != nil && term.ExitCode != 0 {
-		return fmt.Errorf("%s exited %d (%s)", ec.Name, term.ExitCode, term.Reason)
+	var exitErr utilexec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Errorf("%s exited %d", ecName, exitErr.ExitStatus())
 	}
-
-	return nil
+	return err
 }
