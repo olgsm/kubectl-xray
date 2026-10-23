@@ -1,11 +1,14 @@
 package xray
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -146,6 +149,16 @@ func (o *Options) resolveUID(ctx context.Context, pod *corev1.Pod, container str
 // to its UID, and waits for it to run. Work is then exec'd into it via
 // inToolbox, so none of it lands in the container log.
 func (o *Options) startToolbox(ctx context.Context, pod *corev1.Pod, label string) (*corev1.Pod, string, error) {
+	// Checked first: every injected container stays in the pod spec for good,
+	// so don't leave one behind that we can't exec into.
+	review, err := o.clientset.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authv1.SelfSubjectAccessReview{
+		Spec: authv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &authv1.ResourceAttributes{
+			Namespace: o.namespace, Verb: "create", Resource: "pods", Subresource: "exec", Name: pod.Name,
+		}},
+	}, metav1.CreateOptions{})
+	if err == nil && !review.Status.Allowed {
+		return nil, "", fmt.Errorf("you can't exec into pods in namespace %s, which xray needs (create on pods/exec)", o.namespace)
+	}
 	container := o.resolveContainer(pod)
 	uid, gid, pod, err := o.resolveUID(ctx, pod, container)
 	if err != nil {
@@ -168,6 +181,14 @@ func (o *Options) startToolbox(ctx context.Context, pod *corev1.Pod, label strin
 		return nil, "", fmt.Errorf("toolbox %s exited before it could run anything: %d (%s)", ec.Name, term.ExitCode, term.Reason)
 	}
 	return pod, ec.Name, nil
+}
+
+// stripNUL drops the keepalive's NULs from a stream on its way to the user.
+type stripNUL struct{ io.Writer }
+
+func (w stripNUL) Write(p []byte) (int, error) {
+	_, err := w.Writer.Write(bytes.ReplaceAll(p, []byte{0}, nil))
+	return len(p), err
 }
 
 // capture runs command in a toolbox beside the target and writes its stdout to
@@ -195,7 +216,7 @@ func (o *Options) captureOn(ctx context.Context, pod *corev1.Pod, label string, 
 		rw = redact.NewWriter(o.Out)
 		out = rw
 	}
-	err = execInContainer(ctx, o.restConfig, o.clientset, o.namespace, pod.Name, ecName, inToolbox(command...), nil, out, o.ErrOut, false, nil)
+	err = execInContainer(ctx, o.restConfig, o.clientset, o.namespace, pod.Name, ecName, inToolbox(command...), nil, out, stripNUL{o.ErrOut}, false, nil)
 	if rw != nil {
 		if ferr := rw.Flush(); ferr != nil {
 			return ferr

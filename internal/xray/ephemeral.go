@@ -42,10 +42,12 @@ func idleCommand(timeout time.Duration) []string {
 }
 
 // inToolbox wraps command so the toolbox exits once it finishes, however it
-// finishes. The trailing exit keeps "$@" from being the last command, which
-// some shells would exec in place and so skip the EXIT trap.
+// finishes. It refuses to run if it can't mark itself started, since the idle
+// loop would otherwise time out and kill it. The trailing exit keeps "$@" from
+// being the last command, which some shells would exec in place and so skip
+// the EXIT trap.
 func inToolbox(command ...string) []string {
-	return append([]string{"sh", "-c", `touch ` + startedFile + `; trap 'touch ` + doneFile + `' EXIT; trap 'exit 129' HUP INT TERM; "$@"; exit $?`, "xray"}, command...)
+	return append([]string{"sh", "-c", `: > ` + startedFile + ` || { echo "xray: toolbox can't write /tmp" >&2; exit 1; }; trap ': > ` + doneFile + `' EXIT; trap 'exit 129' HUP INT TERM; "$@"; exit $?`, "xray"}, command...)
 }
 
 // probeUID runs the discovery container as an arbitrary nonroot user; it only

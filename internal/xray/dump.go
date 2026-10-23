@@ -99,7 +99,7 @@ func (o *Options) captureInPod(ctx context.Context, label string, innerScript fu
 	}
 	o.logf("%s: writing artifacts into %s inside %s/%s; nothing is streamed out", label, dumpDir, o.namespace, pod.Name)
 	name := fmt.Sprintf("%s-%s", pod.Name, time.Now().Format("2006-01-02_15-04-05"))
-	return o.captureOn(ctx, pod, label, []string{"sh", "-c", "set -e; " + innerScript(name)})
+	return o.captureOn(ctx, pod, label, []string{"sh", "-c", "set -e; " + keepalive + innerScript(name)})
 }
 
 func countTrue(flags ...bool) int {

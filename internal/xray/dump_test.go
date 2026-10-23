@@ -64,6 +64,12 @@ func TestToolboxLifecycle(t *testing.T) {
 	if out, code := capture(t, `false; printf payload`); code != 1 || out != "" {
 		t.Errorf("failing step: exit %d, stdout %q; want 1 and no payload", code, out)
 	}
+
+	readOnly := inToolbox("printf", "payload")
+	readOnly[2] = strings.ReplaceAll(readOnly[2], startedFile, "/nonexistent/started")
+	if out, err := exec.CommandContext(ctx, readOnly[0], readOnly[1:]...).Output(); err == nil || len(out) > 0 {
+		t.Errorf("unwritable /tmp: err %v, stdout %q; want a failure before the command runs", err, out)
+	}
 }
 
 func TestBuildJVMDumpScript(t *testing.T) {
