@@ -146,3 +146,6 @@ CLAUDE.local.md
 
 # Local dump bundles (jvm-dump output)
 /dumps/
+
+# GoReleaser output
+/dist/

@@ -11,6 +11,8 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.rp.outputs.tag_name || steps.tag.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: rp
@@ -22,3 +24,23 @@ jobs:
         run: gh pr merge "${{ fromJSON(steps.rp.outputs.pr).number }}" --squash --repo "$GITHUB_REPOSITORY"
       - if: steps.rp.outputs.pr
         uses: googleapis/release-please-action@v4
+        id: tag
+
+  goreleaser:
+    needs: release-please
+    if: needs.release-please.outputs.tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

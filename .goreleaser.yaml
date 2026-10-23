@@ -1,0 +1,42 @@
+version: 2
+
+builds:
+  - main: ./cmd/kubectl-xray
+    binary: kubectl-xray
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags: [-trimpath]
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+# release-please owns the release notes; only attach the archives.
+changelog:
+  disable: true
+release:
+  mode: keep-existing
+
+krews:
+  - name: xray
+    homepage: https://github.com/olgsm/kubectl-xray
+    short_description: Inspect pods and capture JVM/Go dumps, secrets redacted
+    description: |
+      Runs tools in an ephemeral container beside your app: reads env and runtime
+      facts from distroless pods, captures JVM (thread, histogram, heap, JFR) and
+      Go (pprof) dumps into a local bundle, and opens a debug shell. Picks the pod,
+      UID, namespaces and a restricted security profile for you.
+    repository:
+      owner: olgsm
+      name: kubectl-xray
+      branch: main
+    commit_msg_template: "chore(krew): update xray to {{ .Tag }}"
