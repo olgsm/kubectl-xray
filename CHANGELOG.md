@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.0](https://github.com/olgsm/kubectl-xray/compare/v0.1.1...v0.2.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **capture:** run captures over exec so their output never lands in container logs
+
+### Features
+
+* **release:** publish binaries and a krew index ([644f63e](https://github.com/olgsm/kubectl-xray/commit/644f63e49222abc153233dbf94c8625a5e51a1f0))
+
+
+### Bug Fixes
+
+* **capture:** harden the exec toolbox lifecycle ([cc82ed5](https://github.com/olgsm/kubectl-xray/commit/cc82ed5c231aa5be708ea01c00b241dffc1acae3))
+* **capture:** run captures over exec so their output never lands in container logs ([c140438](https://github.com/olgsm/kubectl-xray/commit/c1404385e7781cb07b2c97acd10f27cd1926e791))
+
 ## [0.1.1](https://github.com/olgsm/kubectl-xray/compare/v0.1.0...v0.1.1) (2026-10-14)
 
 
