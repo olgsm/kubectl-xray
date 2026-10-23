@@ -3,10 +3,6 @@
 ## [0.2.0](https://github.com/olgsm/kubectl-xray/compare/v0.1.1...v0.2.0) (2026-10-23)
 
 
-### ⚠ BREAKING CHANGES
-
-* **capture:** run captures over exec so their output never lands in container logs
-
 ### Features
 
 * **release:** publish binaries and a krew index ([644f63e](https://github.com/olgsm/kubectl-xray/commit/644f63e49222abc153233dbf94c8625a5e51a1f0))
